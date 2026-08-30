@@ -20,18 +20,23 @@ should cite one.
 
 ## Status
 
-Design stage. Only documentation exists so far. `docs/LOW_LEVEL_DESIGN.md`
-§12 has the build order; work top-down through it and keep §12 updated as
-steps land.
+Build steps 1-2 of LLD §12 are done: the package scaffold, the five-maze set,
+grid/world geometry with geodesics and betweenness, and registration with
+upstream's env classes. `python -m latentmine.mazes.render` produces the maze
+figures. 65 fast tests pass; the 6 `slow` tests that exercise the upstream
+monkey-patch need `jaxgcrl` installed and have **not** been run yet.
+
+Next is step 3, `train/run_crl.py`. Work top-down through §12 and keep it
+updated as steps land.
 
 ## Layout (target — most of this is not built yet)
 
 ```
 docs/LOW_LEVEL_DESIGN.md   the design contract
-third_party/JaxGCRL/       git submodule, pinned to 7c53a074
-configs/                   maze specs + training presets (YAML)
+third_party/JaxGCRL/       git submodule, pinned to 7c53a074      [done]
 src/latentmine/            all logic lives here
-  mazes/                   MazeSpec registry, grid<->world geometry, BFS
+  mazes/                   MazeSpec registry, geometry, register  [done]
+configs/                   training presets (YAML)
   train/                   programmatic CRL entrypoint
   checkpoints.py           load params -> jitted phi/psi
   embed.py, sampling.py, rollouts.py

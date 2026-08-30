@@ -311,16 +311,25 @@ it independent of anything the analysis does.
 
 `regions` is `None` for mazes that genuinely have no rooms (`spiral`, `loop` —
 a single corridor has no meaningful partition). Metric C is therefore reported
-only for `open_room`, `two_rooms`, `four_rooms` and `two_rooms_open`, and
+only for `open_room`, `two_rooms` and `four_rooms`, and
 `metrics.py` must skip rather than fabricate it elsewhere. Doorway cells get
 their own region label so they can be excluded from purity scoring — a cell in
 a doorway has genuinely ambiguous membership, and counting it as a failure of
 either room would understate the metric.
 
-`MazeSpec.to_upstream_layout(train: bool)` returns the list-of-lists upstream
-wants. In train layouts every free cell is a goal (uniform goal sampling over
-the free space is what makes the latent map dense and unbiased). Eval layouts
-restrict goals to a far region, mirroring upstream's `*_MAZE_EVAL`.
+`MazeSpec.to_upstream_layout()` returns the list-of-lists upstream wants, by a
+literal one-character-to-one-code mapping with no train/eval transformation
+hidden inside it. Eval layouts are produced instead by
+`MazeSpec.eval_variant(region)`, which restricts goals to the named room and
+turns the rest into free-but-not-a-goal - derived from the overlay rather than
+authored a second time, so a wall edit cannot desynchronise a maze from its
+eval twin.
+
+One upstream constraint discovered while implementing this: upstream cells are
+**single-valued**, `"r"` or `"g"` and never both, and `find_goals` collects only
+`"g"`. So a start cell is *not* sampled as a goal. `S` therefore means "start,
+and not a goal"; with one start per maze that costs a single cell of goal
+coverage, which is cheaper than diverging from upstream's semantics.
 
 The ASCII rows are indexed `grid[i][j]`, so row `i` → world `x`, column `j` →
 world `y`, matching Section 2.5. When plotted with `imshow` this means
@@ -366,58 +375,78 @@ sanity run required by the proposal ("training sample runs on Simple maze and
 Ant maze"), and as a comparison point if a reviewer asks how our mazes relate
 to the benchmark's.
 
-Six layouts. Four carry the "≥ 4 mazes" requirement; the other two exist as
-controls, which is what makes the four interpretable.
+**Five layouts, now implemented** in `src/latentmine/mazes/layouts.py`. Four
+carry the "≥ 4 mazes" requirement; the fifth is a control that doubles as an
+ablation partner. The M0-M5 labels an earlier draft used are gone - the mazes
+are referred to by name, which also stops `M1` meaning both a maze and a
+MacBook.
 
-**M0 `open_room` — control, no interior walls.**
-Geodesic ≡ Euclidean here. Whatever structure appears in the latent projection
-of `open_room` is structure the *method* imposes, not structure the *maze*
-has. Every claim about M1–M4 is stated relative to this baseline. Without it,
-"we see clusters" is unfalsifiable.
+Measured properties of the implemented set (`detour = d_geo / d_euc`,
+`peak/mean` is the betweenness contrast of Section 9):
 
-```
-#########
-#S.......#      (9x9 incl. border)
-#........#
-...
-```
+| maze | grid | free cells | max detour | mean detour | betweenness peak/mean | cut vertices |
+|---|---|---|---|---|---|---|
+| `open_room`  | 9x11  | 63 | 1.08 | 1.04 | 2.51 | 0 |
+| `two_rooms`  | 9x11  | 57 | 4.00 | 1.18 | 8.09 | 3 |
+| `four_rooms` | 11x11 | 68 | 3.83 | 1.23 | 3.71 | 0 |
+| `spiral`     | 11x11 | 49 | 15.00 | 3.68 | 1.53 | 47 |
+| `loop`       | 9x9   | 24 | 2.00 | 1.29 | 1.00 | 0 |
 
-**M1 `two_rooms` — a single one-cell bottleneck.**
-Two open halls joined by one corridor cell. Tests the cleanest possible
-version of Q1: pairs of cells that are close in Euclidean distance but on
-opposite sides of the dividing wall must be far in latent space. This is also
-the ground truth for bottleneck detection (Section 9) — the maze has exactly
-one articulation point and we know where it is.
+**`open_room` — control, and the ablation partner of `two_rooms`.**
+It is exactly `two_rooms` with the dividing wall removed: same extent, same
+start, same region labels, differing in precisely the six cells of column 5.
+The two roles are served by one maze deliberately - an earlier draft had a
+separate `two_rooms_open`, but a second all-open room is the same experiment
+twice, and merging them saves a full training run across seeds and envs, which
+is worth having on a laptop budget.
 
-**M2 `four_rooms` — classic; four halls, four doorways.**
-Tests whether the latent space is *clustered by room*. Gives kNN-room-purity a
-meaningful denominator, and gives the bottleneck detector four targets instead
-of one (so precision, not just recall, is measurable).
+As a control: with no interior wall the measured max detour is 1.08, so
+geodesic and Euclidean distance agree to within the octile discretisation
+error. Whatever structure appears in this maze's latent projection is imposed
+by the method, not by the maze, and every claim about the other four is stated
+relative to it. Without this baseline "we see clusters" is unfalsifiable.
+As an ablation: the a/b split is a bisection with no wall behind it, so room
+purity here is the null that purity on `two_rooms` is read against. Column 5
+keeps the doorway label in both mazes so purity is scored over exactly the same
+56 cells - the delta is then attributable to the wall and nothing else.
 
-**M3 `spiral` — one long winding corridor, no branches.**
-Maximal decoupling of geodesic and Euclidean distance: the corridor's start
-and end can be two cells apart in space and ~40 apart in geodesic. If the
-latent space is a hitting-time embedding, the spiral should *unroll* into a 1-D
-curve under PCA. This is the single most diagnostic maze in the set and the
-best figure in the eventual report.
+**`two_rooms` — one dividing wall, one doorway.**
+Tests the cleanest version of Q1: cells straddling the wall are one step apart
+in space and far apart through the maze (max detour 4.0). Also the sharpest
+bottleneck signal in the set, at 8.1x the mean betweenness.
 
-**M4 `loop` — a ring corridor with a central block.**
-The only maze with a cycle, so there are two homotopy classes of path between
-opposite points. Tests something PCA cannot express: a ring is not linearly
-embeddable in 2-D without either self-intersection or a hole, so this maze is
-where t-SNE/UMAP should visibly beat PCA. Also probes whether the latent
-distance is a true metric or is confused by the two routes being equal-length.
+One correction from implementing it: the passage is **three** cells, not one.
+The wall occupies column 5 only, so crossing means traversing
+`(4,4) -> (4,5) -> (4,6)`, and all three are cut vertices. Detection scoring
+must expect a three-cell answer here, not a single cell.
 
-**M5 `two_rooms_open` — M1 with the dividing wall removed.**
-The ablation pair. "Assess how changing the structure of the maze changes the
-visualisations" is answered most cleanly by holding *everything else* fixed —
-same size, same start distribution, same seeds, same hyperparameters — and
-flipping one wall. Delta in the Q1 metrics between M1 and M5 is the answer.
+**`four_rooms` — four halls, four doorways.**
+Tests whether the latent space clusters *by room*, giving room purity a
+meaningful denominator, and gives the bottleneck detectors four targets so
+precision is measurable rather than only recall.
 
-Additionally, `dead_end` cells (short stubs off a corridor) are added to M2 as
-a secondary probe: a hitting-time embedding should place a dead-end cell *far*
-from everything, since it is on no shortest path. This costs nothing extra to
-train and gives a bonus observation.
+**`spiral` — one winding corridor, width 1, no branches.**
+Maximal decoupling of geodesic from Euclidean distance: measured max detour is
+15.0 and the mean is 3.68, far above every other maze. The two corridor
+endpoints are 48 steps apart through the maze and about 5.7 cells apart in
+space. If the latent space is a hitting-time embedding the spiral should
+*unroll* into a 1-D curve under PCA, which makes this the most diagnostic maze
+in the set. It also happens to have 49 free cells against `open_room`'s 63, so
+the extreme case and the control are within a factor of 1.3 on sample size.
+
+Its two endpoints are the set's only true dead ends - no shortest path between
+any other pair passes through them - which is the dead-end probe an earlier
+draft proposed bolting onto `four_rooms`. It comes free here, so no stubs are
+carved. Two cells is a thin sample; a dedicated dead-end maze stays an optional
+extra rather than something the argument rests on.
+
+**`loop` — a ring corridor around a solid centre.**
+The only maze with a cycle, so opposite points are joined by two equally good
+routes. Tests something PCA cannot express: a ring has no faithful linear 2-D
+embedding, so this is where t-SNE and UMAP should visibly beat PCA. Its
+betweenness is perfectly uniform (peak/mean exactly 1.00, a useful sanity check
+on the implementation), so it is also the maze where any bottleneck detector
+should report nothing at all.
 
 Each maze is instantiated for **both** `SimpleMaze` (2-D point mass, fast,
 used for debugging and for all pipeline development) and `AntMaze` (29-D,
@@ -460,7 +489,8 @@ The proposal calls for depth, citing *Scaling CRL*. Default and sweep:
 | `deep`      | 4         | 256     | 4                  | True     | 64         |
 | `deeper`    | 8         | 512     | 4                  | True     | 64         |
 
-`deep` is the project default; `shallow` is run on M1 and M3 only, as evidence
+`deep` is the project default; `shallow` is run on `two_rooms` and `spiral`
+only, as evidence
 for the "depth improves representation quality" claim, measured with our Q1
 metric rather than with return. Note that depth and LayerNorm move together in
 upstream's config space (both encoders take `use_ln`, and residual blocks
@@ -468,7 +498,7 @@ without normalisation are unstable at depth 8), so the `shallow`→`deep`
 comparison is a comparison of *configurations*, not of depth alone. Say so in
 the report rather than over-claiming.
 
-`repr_dim` stays 64 throughout. A `repr_dim ∈ {8, 16, 64}` sweep on M3 is a
+`repr_dim` stays 64 throughout. A `repr_dim ∈ {8, 16, 64}` sweep on `spiral` is a
 cheap optional extra: low `repr_dim` should force the maze structure to be more
 explicitly laid out, and 8 dimensions may be directly plottable.
 
@@ -488,7 +518,7 @@ budget in this document (SimpleMaze 10M, AntMaze 50M, six mazes × three seeds
 × two envs) was written before that was known. Section 5.6 replaces it.
 Seeds `{1, 2, 3}`. `visualization_interval=10`, `checkpoint_logdir` always set.
 
-An `energy_fn ∈ {norm, dot}` comparison on M1 is a deliberate secondary
+An `energy_fn ∈ {norm, dot}` comparison on `two_rooms` is a deliberate secondary
 experiment: the "Why is CRL latent space nice" paper's claims are
 energy-dependent, and having both lets us say which geometry is more legible.
 
@@ -704,7 +734,7 @@ coordinates, and `d_lat(u, v) = ||psi(u) - psi(v)||_2`.
 **A. Geodesic vs Euclidean correlation (Q1, headline).**
 Spearman `rho(d_lat, d_geo)` and `rho(d_lat, d_euc)` over all pairs in `F`.
 Report both plus the gap. On `open_room` the two are near-identical by
-construction — that is the control that makes the gap on M1–M4 meaningful.
+construction — that is the control that makes the gap on the other four meaningful.
 Also report partial correlation of `d_lat` with `d_geo` controlling for
 `d_euc`, which is the statistic that actually isolates "knows about walls".
 
@@ -716,11 +746,12 @@ A ratio near 1 means the encoder ignores walls; large means it respects them.
 This is a single number per maze and is the cleanest headline result.
 
 **C. Room purity (Q2).**
-For mazes carrying a `regions` overlay (Section 4.1) — M0, M1, M2, M5 —
+For mazes carrying a `regions` overlay (Section 4.1) — `open_room`,
+`two_rooms`, `four_rooms` —
 fraction of each cell's `k=10` latent nearest neighbours sharing its region
 label, excluding doorway cells. Compared against the same statistic computed on
 raw `(x, y)`, which is the "no information beyond position" null. Not defined
-for M3/M4, which have no rooms.
+for `spiral`/`loop`, which have no rooms.
 
 **D. Projection faithfulness (Q2).**
 Trustworthiness and continuity of the 2-D PCA/t-SNE/UMAP embedding w.r.t. the
@@ -807,9 +838,10 @@ question the proposal asks.
 
 ### 7.4 Structure ablation (deliverable 2.3)
 
-M1 vs M5 (wall present vs removed), identical otherwise. Report the delta in
+`two_rooms` vs `open_room` (wall present vs removed), identical otherwise.
+Report the delta in
 metrics A, B, C and the two latent maps side by side. Secondary ablation:
-train on M2 (`four_rooms`) and evaluate the M2 encoder on states from M5 —
+train on `four_rooms` and evaluate that encoder on states from `open_room` —
 i.e. does the latent space encode *this* maze or mazes in general.
 
 ---
@@ -837,8 +869,9 @@ held-out split.
 
 Splitting the decoder's data randomly would let it memorise a lookup table
 over sampled cells, and reconstruction error would be meaninglessly low.
-Instead: **hold out whole regions.** For M2, train on three rooms and test on
-the fourth, using the `regions` overlay (Section 4.1) as the split; for M3,
+Instead: **hold out whole regions.** For `four_rooms`, train on three rooms and
+test on the fourth, using the `regions` overlay (Section 4.1) as the split; for
+`spiral`,
 which has no rooms, hold out a contiguous arc of the spiral by geodesic index
 from the corridor's start. Report train,
 in-distribution-held-out-samples, and held-out-region errors separately. Only
@@ -876,23 +909,49 @@ four.
 
 ## 9. Bottlenecks (advanced)
 
+**Ground truth is betweenness centrality, not articulation points.** The
+earlier draft of this section named articulation points, which is exact,
+cheap, and wrong for most of this maze set - a correction that fell out of
+implementing `mazes/geometry.py`:
+
+- `four_rooms` has **no articulation points at all**. Four doorways mean there
+  is always a second route, so no single cell disconnects the maze - yet the
+  four doorways are plainly the bottlenecks, and this is precisely the maze
+  meant to make detector *precision* measurable.
+- `spiral` has 47 of 49 free cells as articulation points, since every interior
+  cell of a corridor is a cut vertex. Labelling 96% of a maze "bottleneck" is
+  no more useful than labelling none of it.
+
+`geometry.betweenness_centrality` (Brandes on the weighted maze graph) degrades
+gracefully in both cases, and its peak-to-mean contrast separates the set
+cleanly: 8.09 on `two_rooms`, 3.71 on `four_rooms`, 2.51 on `open_room`, and
+exactly 1.00 on `loop`, whose ring is uniform by symmetry. `articulation_points`
+is kept for the cases where it *is* the right question (it returns the correct
+three-cell passage for `two_rooms`).
+
+One scoring caveat, measured: in `four_rooms` all four doorways score an
+identical 0.246, but their eight flanking cells score 0.251 and so outrank
+them, because a flanking cell carries the doorway's traffic *plus* intra-room
+traffic. A detector that points at a cell adjacent to a doorway has not failed,
+so detection must be scored with a **one-cell tolerance** rather than by exact
+cell match.
+
 `analysis/bottleneck.py`, three independent detectors over `psi(F)`, scored
-against ground truth (articulation points / minimum vertex cuts of the free-cell
-graph, computable exactly since we authored the mazes):
+against that ground truth:
 
 1. **Spectral.** kNN graph on latent distances, Fiedler vector of the
    normalised Laplacian; cells adjacent to a sign change are candidate
-   bottlenecks. Natural fit for M1 (a single cut).
+   bottlenecks. Natural fit for `two_rooms` (a single cut).
 2. **Betweenness.** Betweenness centrality on the latent kNN graph. Handles
-   M2's four doorways, where a single Fiedler cut is the wrong model.
+   `four_rooms`' four doorways, where a single Fiedler cut is the wrong model.
 3. **Latent stretch.** Finite-difference estimate of `||∂psi/∂(x,y)||` per
    cell. A doorway forces all traffic through a small spatial region, so if
    latent distance is hitting time the map should be locally *stretched* there.
    This detector uses no graph construction at all, so it fails independently
    of the other two — worth having for that reason alone.
 
-Report precision/recall against ground truth per maze. M2 is the discriminating
-case; M0 (`open_room`, no bottlenecks) is the false-positive test — a detector
+Report precision/recall against ground truth per maze. `four_rooms` is the
+discriminating case; `open_room` is the false-positive test — a detector
 that "finds" bottlenecks in an empty room is measuring its own hyperparameters.
 
 **Bottlenecks as subgoals.** Feed detected bottlenecks as intermediate goals
@@ -906,7 +965,7 @@ declare an edge open iff `d_lat` is below a threshold calibrated on known-open
 pairs; the resulting edge set gives an occupancy grid. Score with edge-F1 and
 occupancy IoU against ground truth. The interesting question is not whether
 this works on the training maze — it is whether the threshold calibrated on
-M1 transfers to M2 without recalibration.
+`two_rooms` transfers to `four_rooms` without recalibration.
 
 ---
 
@@ -971,9 +1030,12 @@ end-to-end through embedding and one figure.
 Each step ends with something inspectable; nothing is built before the thing
 that validates it.
 
-1. Scaffolding: `pyproject.toml`, submodule, package skeleton, CI, tests.
-2. `mazes/` (layouts, geometry, register) + tests. **Milestone: render all six
-   mazes to PNG and eyeball them.** Cheap, and catches the axis convention.
+1. ~~Scaffolding: `pyproject.toml`, submodule, package skeleton, tests.~~ **Done.**
+2. ~~`mazes/` (layouts, geometry, register) + tests.~~ **Done** - five mazes
+   render to `figures/mazes/`, 65 fast tests pass, 6 integration tests for the
+   upstream monkey-patch are written and marked `slow`, awaiting a machine with
+   `jaxgcrl` installed. The axis convention is asserted directly rather than
+   through a round trip, which a transposition would pass.
 3. `train/run_crl.py` + `manifest.json` + wandb. **Milestone: 10k-step
    SimpleMaze run completes and checkpoints.**
 3.5 `train/crl_resumable.py` (Section 5.5) and the timing probe (Section 5.6).
@@ -986,7 +1048,7 @@ that validates it.
    Do not proceed past this until it holds.
 5. Full SimpleMaze training across all six mazes × 3 seeds, `deep` preset.
 6. `analysis/` — projections, metrics A–D, plots. **Milestone: the distance
-   field figure (§7.2) for M1 and M3.** This is the go/no-go for the whole
+   field figure (§7.2) for `two_rooms` and `spiral`.** This is the go/no-go for the whole
    research question.
 7. AntMaze training (long; start it in the background as soon as step 3 is
    validated, in parallel with 4–6).

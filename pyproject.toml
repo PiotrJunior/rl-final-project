@@ -1,0 +1,44 @@
+[project]
+name = "latentmine"
+version = "0.1.0"
+description = "Contrastive RL latent mining - what does a CRL critic encode about its maze?"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "matplotlib",
+  "pyyaml",
+]
+
+[project.optional-dependencies]
+# Training and anything that touches the encoders needs the pinned upstream,
+# installed separately from third_party/JaxGCRL. Kept out of the base deps so
+# that `mazes` and `analysis` stay importable (and testable) without JAX.
+dev = ["pytest", "ruff"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "slow: needs JAX/brax or a training run; excluded from the fast check",
+]
+
+# Matches upstream JaxGCRL's config so the two codebases read the same.
+[tool.ruff]
+line-length = 110
+indent-width = 4
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

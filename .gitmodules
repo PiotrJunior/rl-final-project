@@ -1,0 +1,3 @@
+[submodule "third_party/JaxGCRL"]
+	path = third_party/JaxGCRL
+	url = https://github.com/MichalBortkiewicz/JaxGCRL.git
