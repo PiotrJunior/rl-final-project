@@ -707,6 +707,36 @@ the Ant runs is a better use of a day than reducing the SimpleMaze study —
 Section 12's guidance stands: three seeds of the core beats one seed of
 everything.
 
+### 5.3b Configuration is validated before JAX loads
+
+Upstream enforces its two hard constraints late: `CRL.check_config` asserts the
+batch divisibility rule, and `num_training_steps_per_epoch > 0` is a bare
+`assert` after env setup. On a laptop, discovering either after JAX has
+compiled is a wasted minute every time, and the assertion text does not say
+what to change.
+
+`train/presets.py` therefore re-derives every quantity `train_fn` computes -
+`env_steps_per_actor_step`, prefill, steps per epoch, actual total, buffer
+bytes, utd ratio - and validates them at construction, with errors that name a
+remedy ("nearest valid num_envs: [128, 64, 192, 256]"). It imports no JAX,
+brax or mujoco, which is what lets `run_crl --dry-run` print the resolved
+configuration in a second on a machine with no training stack at all. A test
+asserts that JAX-free property rather than trusting it.
+
+The same separation gives the env dimension table (`ENV_SPECS`): `state_dim`,
+`action_size` and `goal_size` are hardcoded so the config layer and the
+manifest need no env instance, and `envs.build_env` asserts every one of them
+against the constructed env, so they are checked invariants rather than
+assumptions.
+
+One measured consequence worth recording: shortening `episode_length` to 501
+for the laptop budget halves the update-to-data ratio relative to upstream's
+defaults (0.0316 against 0.0630), because fewer gradient updates are taken per
+env step. `describe` prints both numbers side by side and suggests
+`--train-step-multiplier 2` when ours falls well below. That is a real
+consequence of the budget cut, not an incidental one, and it should not be
+discovered from a flat training curve.
+
 ### 5.4 Logging
 
 wandb project `crl-latent-mining`, group = maze name, run name = `run_id`.
@@ -1036,8 +1066,12 @@ that validates it.
    upstream monkey-patch are written and marked `slow`, awaiting a machine with
    `jaxgcrl` installed. The axis convention is asserted directly rather than
    through a round trip, which a transposition would pass.
-3. `train/run_crl.py` + `manifest.json` + wandb. **Milestone: 10k-step
-   SimpleMaze run completes and checkpoints.**
+3. ~~`train/run_crl.py` + `manifest.json` + wandb.~~ **Done** - `presets.py`
+   (architecture presets, env dimension table, `RunSpec` with every upstream
+   constraint checked before launch), `manifest.py`, `envs.py`, and the CLI.
+   `--dry-run` resolves and reports a whole configuration without importing
+   JAX. The 10k-step milestone run is written as a `slow` test
+   (`TestEndToEnd`) and still needs a machine with `jaxgcrl` installed.
 3.5 `train/crl_resumable.py` (Section 5.5) and the timing probe (Section 5.6).
    **Milestone: kill a run with `SIGKILL` mid-epoch, resume it, and confirm
    the training curve has no discontinuity at the seam.** Do this before any

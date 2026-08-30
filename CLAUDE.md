@@ -20,14 +20,18 @@ should cite one.
 
 ## Status
 
-Build steps 1-2 of LLD §12 are done: the package scaffold, the five-maze set,
-grid/world geometry with geodesics and betweenness, and registration with
-upstream's env classes. `python -m latentmine.mazes.render` produces the maze
-figures. 65 fast tests pass; the 6 `slow` tests that exercise the upstream
-monkey-patch need `jaxgcrl` installed and have **not** been run yet.
+Build steps 1-3 of LLD §12 are done: the package scaffold, the five-maze set,
+grid/world geometry, registration with upstream's env classes, and the
+training entrypoint (presets, run-spec validation, manifests, env
+construction, CLI).
 
-Next is step 3, `train/run_crl.py`. Work top-down through §12 and keep it
-updated as steps land.
+161 fast tests pass. 23 `slow` tests need `jaxgcrl` installed and have **not**
+been run — they cover the upstream monkey-patch, the env dimension table, and
+a tiny end-to-end training run. Run them before the first long run.
+
+Next is step 3.5: the resumable `train_fn` derivative (§5.5) and the timing
+probe (§5.6). Do not start a long run before the resume path is tested by a
+deliberate `SIGKILL`.
 
 ## Layout (target — most of this is not built yet)
 
@@ -36,8 +40,7 @@ docs/LOW_LEVEL_DESIGN.md   the design contract
 third_party/JaxGCRL/       git submodule, pinned to 7c53a074      [done]
 src/latentmine/            all logic lives here
   mazes/                   MazeSpec registry, geometry, register  [done]
-configs/                   training presets (YAML)
-  train/                   programmatic CRL entrypoint
+  train/                   presets, manifest, envs, run_crl        [done]
   checkpoints.py           load params -> jitted phi/psi
   embed.py, sampling.py, rollouts.py
   analysis/                projections, metrics, plots, bottleneck, reconstruct
@@ -117,7 +120,10 @@ ruff check src tests && ruff format --check src tests
 # render the maze set (first milestone; catches the axis convention)
 python -m latentmine.mazes.render --out figures/mazes
 
-# train (resumes automatically if runs/<run_id>/resume/latest.json exists)
+# check a configuration in one second, importing no JAX
+python -m latentmine.train.run_crl --maze two_rooms --env simple --dry-run
+
+# train
 caffeinate -i python -m latentmine.train.run_crl \
     --maze two_rooms --env simple --preset deep --seed 1
 

@@ -36,6 +36,28 @@ _WALL_RGBA = "0.7 0.5 0.3 1.0"
 
 _ORIGINALS: dict[str, Callable] = {}
 
+# Specs resolvable by the patched `make_maze`. Seeded from the static maze set
+# and extended at runtime by `register_spec`, which is how derived specs - eval
+# variants, chiefly - become constructible without editing `layouts.MAZES`.
+_RUNTIME: dict[str, MazeSpec] = {}
+
+
+def register_spec(spec: MazeSpec, overwrite: bool = False) -> None:
+    """Make a spec resolvable by name, for specs not in the static set."""
+    known = _resolve(spec.name)
+    if known is not None and not overwrite and known is not spec:
+        raise ValueError(f"maze {spec.name!r} is already registered; pass overwrite=True to replace")
+    _RUNTIME[spec.name] = spec
+
+
+def registered_specs() -> dict[str, MazeSpec]:
+    """Everything the patched `make_maze` can resolve: the static set plus runtime additions."""
+    return {**MAZES, **_RUNTIME}
+
+
+def _resolve(name: str) -> MazeSpec | None:
+    return _RUNTIME.get(name) or MAZES.get(name)
+
 
 def build_maze_xml(
     asset_xml_path: str,
@@ -89,7 +111,7 @@ def _make_registry_maze_fn(module: Any, original: Callable) -> Callable:
     """Wrap upstream's `make_maze` so our specs resolve and its own still do."""
 
     def make_maze(maze_layout_name: str, maze_size_scaling: float):
-        spec: MazeSpec | None = MAZES.get(maze_layout_name)
+        spec: MazeSpec | None = _resolve(maze_layout_name)
         if spec is None:
             return original(maze_layout_name, maze_size_scaling)
 
@@ -139,8 +161,10 @@ def install(modules: tuple[str, ...] = ("simple_maze", "ant_maze")) -> tuple[str
 
 
 def uninstall() -> None:
-    """Restore upstream's `make_maze`. For tests; not used in normal operation."""
+    """Restore upstream's `make_maze` and drop runtime specs. For tests."""
     import importlib
+
+    _RUNTIME.clear()
 
     for short, original in list(_ORIGINALS.items()):
         importlib.import_module(f"jaxgcrl.envs.{short}").make_maze = original
