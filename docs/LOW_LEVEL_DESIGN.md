@@ -481,12 +481,201 @@ which matters when we later interpolate in `psi`-space and decode),
 `logsumexp_penalty_coeff=0.1`, `episode_length=1001`, `num_envs=512`
 (satisfies `512*1000 % 256 == 0`), `action_repeat=1`.
 
-Budget: SimpleMaze `total_env_steps=10M`; AntMaze `50M`. Seeds `{1, 2, 3}`.
-`num_evals=50`, `visualization_interval=10`, `checkpoint_logdir` always set.
+Budget: **to be set from a measured timing probe, not guessed** — see
+Section 5.6. The reference hardware for this project is a laptop, not the
+single-GPU machine upstream's throughput claims assume, and the original
+budget in this document (SimpleMaze 10M, AntMaze 50M, six mazes × three seeds
+× two envs) was written before that was known. Section 5.6 replaces it.
+Seeds `{1, 2, 3}`. `visualization_interval=10`, `checkpoint_logdir` always set.
 
 An `energy_fn ∈ {norm, dot}` comparison on M1 is a deliberate secondary
 experiment: the "Why is CRL latent space nice" paper's claims are
 energy-dependent, and having both lets us say which geometry is more legible.
+
+### 5.5 Checkpointing and resume
+
+#### What upstream saves, and why it cannot resume
+
+At each of the `num_evals` epoch boundaries `crl.py` writes a pickled 3-tuple
+of **parameters only** (Section 2.7). Everything else the loop carries is
+discarded:
+
+| carried at the epoch boundary | in upstream's checkpoint? |
+|---|---|
+| `actor/critic/alpha_state.params` | yes |
+| `actor/critic/alpha_state.opt_state` (Adam moments) | **no** |
+| `training_state.env_steps`, `gradient_steps` | no |
+| `env_state` — the `num_envs` in-flight episodes | no |
+| `buffer_state` — replay data, insert/sample positions, buffer RNG | no |
+| the outer `key` | no |
+| loop counter `ne`, `training_walltime` | no |
+
+`progress_fn` cannot fix this from outside: it is handed
+`training_state.actor_state.params` and nothing else. So upstream checkpoints
+are **restart-for-analysis artifacts, not resume artifacts**, and crash
+recovery has to be added.
+
+#### Two tiers, deliberately different
+
+- **Analysis checkpoints** — `runs/<run_id>/ckpt/step_*.pkl`. Upstream's exact
+  format and cadence, params only, immutable, one per epoch, all retained.
+  These feed the latent snapshots (Section 5.4) and every downstream analysis.
+  Keeping the format byte-compatible means `checkpoints.load_encoders` also
+  works on runs produced by an unmodified upstream, which is worth more than
+  any tidying we might do.
+- **Resume checkpoints** — `runs/<run_id>/resume/`. Everything in the table
+  above, rewritten every epoch, only the last two retained. Never read by the
+  analysis code.
+
+Splitting them matters because their retention policies are opposite: analysis
+wants every step kept forever and is small; resume wants only the newest and is
+large.
+
+#### Size
+
+`buffer_state.data` has shape `(max_replay_size, num_envs, data_size)` in
+float32, where `data_size = obs_size + action_size + 4` (reward, discount,
+truncation, traj_id):
+
+| env | `data_size` | buffer @ `num_envs=512` | @ `num_envs=128` |
+|---|---|---|---|
+| `SimpleMaze` | 6 + 2 + 4 = 12 | 245 MB | 61 MB |
+| `AntMaze` | 31 + 8 + 4 = 43 | 880 MB | 220 MB |
+
+Params plus Adam moments for the `deep` preset are only single-digit MB, and
+`env_state` is tens of MB. So the buffer is essentially the whole checkpoint,
+and at laptop-scale `num_envs` it is small enough that **checkpointing it is
+clearly worth it**: the alternative is re-paying prefill on every resume, which
+is `min_replay_size * num_envs` env steps (512k at upstream defaults — around
+5% of a 10M-step run) and also throws away the buffer's contents.
+
+#### Atomicity — the part that actually saves the run
+
+The failure that destroys a run is not a crash between writes, it is a crash
+*during* one. So:
+
+1. Serialize to `resume/state_<slot>.msgpack.tmp` in the same directory as the
+   target (a rename is only atomic within a filesystem).
+2. `flush()` then `os.fsync()` the file descriptor.
+3. `os.replace()` onto `resume/state_<slot>.msgpack` — atomic on APFS and any
+   POSIX filesystem.
+4. Write a new `resume/latest.json` (pointing at the slot, with the step count
+   and a SHA-256 of the payload) through the same tmp-fsync-replace dance.
+
+Slots alternate `a`/`b`, so a torn write can never damage the previous good
+checkpoint. On load, verify the checksum from `latest.json`; on mismatch, fall
+back to the other slot and log loudly. Nothing is ever written in place.
+
+**Serialization is `flax.serialization.to_bytes` (msgpack), not `pickle`.**
+Pickling a `flax.struct.dataclass` embeds the defining module path, so a
+submodule bump that moves a class silently makes every checkpoint unloadable —
+this is exactly why we already refuse to read upstream's `args.pkl`
+(Section 2.7). msgpack stores arrays only; the pytree template is rebuilt from
+`manifest.json` before deserializing.
+
+#### Where the hook goes
+
+The epoch loop is plain Python (`for ne in range(config.num_evals)`), so the
+boundary is natural — but it sits inside `CRL.train_fn`, and no callback there
+receives the training state. Monkey-patching cannot reach into the middle of a
+function, so we vendor a derivative:
+
+`src/latentmine/train/crl_resumable.py` — a copy of `train_fn` taken at the
+pinned commit, with three changes: load resume state before the loop; start
+the loop at `ne_start` instead of 0; save resume state after each epoch. The
+`assert total_steps >= config.total_env_steps` at the end has to become
+resume-aware.
+
+Drift guard: a test asserts the SHA-256 of upstream's `crl.py` equals the value
+recorded when the copy was taken. Bumping the submodule then fails loudly and
+someone re-derives the copy, instead of the fork silently diverging.
+
+*Rejected alternative — segmented training.* Chain several short runs, each
+loading the previous one's params. It needs no code changes at all, which is
+genuinely appealing. But it resets the Adam moments and refills the replay
+buffer at every boundary, putting a transient in every training curve at a
+known location, and those artifacts land in the same plots we intend to draw
+conclusions from. Kept only as an emergency fallback if the vendored copy
+proves unmaintainable.
+
+#### Granularity is a dial
+
+One epoch is
+`(total_env_steps - min_replay_size * num_envs) / (num_evals * num_envs * unroll_length)`
+training steps, and a crash costs at most one epoch. So `num_evals` *is* the
+"how much work can I afford to lose" setting. Raising it is not free: each eval
+runs `num_eval_envs` complete episodes, which on CPU is a real cost — so lower
+`num_eval_envs` (32 is plenty for a health check) when raising `num_evals`.
+Note the guard `assert num_training_steps_per_epoch > 0`: pushing `num_evals`
+too high for a given `total_env_steps` fails at startup.
+
+`train/run_crl.py` takes `--resume auto|never|<path>`, defaulting to `auto`:
+resume if `resume/latest.json` exists and its config hash matches the requested
+config, otherwise start fresh. A config mismatch is a hard error, never a
+silent fresh start — silently restarting a 6-hour run from zero is worse than
+crashing.
+
+### 5.6 Running on Apple Silicon (the actual target hardware)
+
+The reference machine for this project is an M1 Pro MacBook with 32 GB, which
+invalidates several assumptions written above.
+
+**There is no CUDA, and effectively no GPU.** `pyproject.toml`'s non-Linux
+branch installs plain `jaxlib==0.4.25`, so JAX runs on **CPU**. Apple's
+`jax-metal` PJRT plugin exists, but it is experimental, tightly coupled to
+particular JAX versions, and has incomplete op coverage that Brax and MJX
+routinely trip over. Treat it as an experiment to be smoke-tested, never as the
+plan: if a 10k-step run does not produce numerically sane metrics on metal,
+drop it without further investigation.
+
+**Consequences that change the plan:**
+
+- *`num_envs=512` is a GPU number.* On CPU the vectorisation payoff saturates
+  much earlier and memory pressure arrives sooner. Start at 128 and let the
+  probe below settle it. Keep `num_envs * (episode_length - 1) % batch_size == 0`.
+- *`episode_length=1001` is wasteful for small mazes.* Crossing a 9×9 maze
+  takes far fewer than 1000 steps, and cost is linear in episode length. 501 is
+  a reasonable start. This is not a free knob — `flatten_batch` samples the
+  future goal within an episode, so episode length sets the horizon the critic
+  is trained over. Shortening it is defensible for small mazes but must be held
+  *identical across all mazes and seeds*, since it changes what the latent
+  space means.
+- *Backend:* `spring` (upstream's default for both maze envs) is far cheaper
+  than `mjx` on CPU. Do not switch to `mjx`.
+- *Prevent sleep:* run under `caffeinate -i`. A closed lid mid-run is the most
+  likely "crash" on a laptop, and it is the one the resume path will actually
+  be exercised by.
+- *wandb offline:* `wandb_mode="offline"`, synced afterwards, so a network drop
+  cannot stall training.
+- Thermal throttling over multi-hour runs makes `training/sps` drift downward.
+  That is expected; do not read it as a training pathology.
+
+**Step 3.5 of the build order: measure before committing to a budget.**
+Upstream's "10M steps in 10 minutes" is a single-GPU figure. CPU will be one to
+two orders of magnitude below it, but the exact factor depends on env,
+`num_envs` and backend in ways not worth predicting. So: run
+`total_env_steps=200_000` on `two_rooms` for both `SimpleMaze` and `AntMaze`,
+record `training/sps`, and derive every budget in the project from the measured
+number. Sweep `num_envs ∈ {64, 128, 256}` in the same probe; it is a few
+minutes of work and it sets a parameter that multiplies every run afterwards.
+
+**Expected restructuring of the experiment plan.** Pending those numbers, the
+likely shape is:
+
+- `SimpleMaze` becomes the primary platform and carries the full design — all
+  six mazes × three seeds. Its physics is a 2-DOF point mass, which is the
+  cheapest thing in the repository.
+- `AntMaze` becomes a reduced study: one or two mazes (`two_rooms` for the
+  bottleneck result, `spiral` for the geodesic result), fewer seeds, run
+  overnight. The Ant results answer Q3, which needs *some* Ant runs, not the
+  full grid.
+- The `deeper` preset, the `energy_fn` comparison and the `repr_dim` sweep are
+  the first things cut.
+
+If the probe shows even that is out of reach, renting a single cloud GPU for
+the Ant runs is a better use of a day than reducing the SimpleMaze study —
+Section 12's guidance stands: three seeds of the core beats one seed of
+everything.
 
 ### 5.4 Logging
 
@@ -786,7 +975,12 @@ that validates it.
 2. `mazes/` (layouts, geometry, register) + tests. **Milestone: render all six
    mazes to PNG and eyeball them.** Cheap, and catches the axis convention.
 3. `train/run_crl.py` + `manifest.json` + wandb. **Milestone: 10k-step
-   SimpleMaze run on M1 completes and checkpoints.**
+   SimpleMaze run completes and checkpoints.**
+3.5 `train/crl_resumable.py` (Section 5.5) and the timing probe (Section 5.6).
+   **Milestone: kill a run with `SIGKILL` mid-epoch, resume it, and confirm
+   the training curve has no discontinuity at the seam.** Do this before any
+   long run, not after the first one dies. Then set all budgets from the
+   measured `training/sps`.
 4. `checkpoints.py`, `embed.py`. **Milestone: load a checkpoint, embed a grid,
    confirm `d_lat` to the goal decreases along a successful rollout** (§7.1).
    Do not proceed past this until it holds.
@@ -820,3 +1014,7 @@ core.
 | Linear latent interpolation leaves the manifold | Decoded waypoints are garbage; looks like a negative result but is not | Latent graph geodesic (§8.3 baseline 4) built up front |
 | Upstream submodule bump breaks the monkey-patch | Silent fallback to wrong layouts | `register` test asserts both our and upstream names resolve; pin the commit |
 | `deep` vs `shallow` confounded with LayerNorm | Over-claiming "depth helps" | State the confound; optionally run `n_hidden=4, use_ln=False` as a third arm |
+| Laptop CPU throughput far below the plan's assumption | The full grid never finishes; results thin across the board | Timing probe at step 3.5 sets budgets from measurement; SimpleMaze carries the design, Ant reduced (§5.6) |
+| Crash / lid close loses hours of training | Upstream checkpoints cannot resume — params only, no optimiser state | Resume checkpoints (§5.5), `caffeinate -i`, resume path tested by deliberate `SIGKILL` before any long run |
+| Torn checkpoint write during a crash | The one artifact you need is the one that is corrupt | tmp + fsync + atomic rename, two-slot rotation, checksum verified on load (§5.5) |
+| Vendored `train_fn` copy drifts from upstream | Silent divergence from the pinned implementation | SHA-256 drift test on upstream `crl.py` |

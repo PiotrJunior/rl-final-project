@@ -55,6 +55,10 @@ tests/
   bare 3-tuple with no architecture record; rebuilding the encoders needs
   `repr_dim`, `h_dim`, `n_hidden`, `skip_connections`, `use_relu`, `use_ln`.
   Go through `checkpoints.load_encoders`, not through raw `pickle`.
+- **Upstream checkpoints cannot resume training.** They hold params only — no
+  optimiser state, step count, replay buffer or RNG. Crash recovery goes
+  through our own resume checkpoints (LLD §5.5); never assume a
+  `ckpt/step_*.pkl` is enough to continue a run.
 - Seeds are explicit arguments, never global state. Every figure and metric is
   reported over ≥ 3 seeds.
 - Artifacts are derived data and are gitignored: `runs/`, `artifacts/`,
@@ -91,6 +95,10 @@ the traps:
 Nothing is implemented yet; these are the intended entry points and should be
 kept accurate as they land.
 
+Target hardware is an M1 Pro MacBook: **CPU-only JAX, no CUDA**. Budgets come
+from the timing probe in LLD §5.6, not from upstream's single-GPU throughput
+claims. Long runs go under `caffeinate -i`.
+
 ```bash
 # setup
 git submodule update --init --recursive
@@ -104,8 +112,12 @@ ruff check src tests && ruff format --check src tests
 # render the maze set (first milestone; catches the axis convention)
 python -m latentmine.mazes.render --out figures/mazes
 
-# train
-python -m latentmine.train.run_crl --maze two_rooms --env simple --preset deep --seed 1
+# train (resumes automatically if runs/<run_id>/resume/latest.json exists)
+caffeinate -i python -m latentmine.train.run_crl \
+    --maze two_rooms --env simple --preset deep --seed 1
+
+# throughput probe before setting any budget
+python -m latentmine.train.probe --env simple --num-envs 64,128,256
 ```
 
 ## Git
