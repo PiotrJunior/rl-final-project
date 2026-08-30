@@ -270,6 +270,7 @@ moves into the package. This keeps the pipeline reproducible from the CLI.
 class MazeSpec:
     name: str
     grid: tuple[str, ...]        # ASCII rows; '#'=wall '.'=free 'S'=start 'G'=goal-only
+    regions: tuple[str, ...] | None = None   # optional ASCII overlay, same shape
     scaling: float = 4.0
     notes: str = ""              # what hypothesis this maze tests
 ```
@@ -283,6 +284,38 @@ ASCII is the source of truth because it is diffable and reviewable. Characters:
 | `.`  | free, valid goal                               | `"g"`         |
 | `G`  | free, valid goal, but never a start            | `"g"`         |
 | `-`  | free, **not** a goal (eval layouts only)       | `0`           |
+
+**`regions` — hand-authored room labels.** Upstream has no concept of a room,
+a region, or any grouping of cells: a layout is a flat grid of wall / start /
+goal codes and nothing more. But metric C (room purity, Section 6) and the
+decoder's spatial holdout (Section 8.2) both need to know which room a cell
+belongs to, so `MazeSpec` carries an optional second ASCII overlay of the same
+shape, one character per cell naming its region:
+
+```
+grid            regions
+#########       #########
+#S..#...#       #aaa#bbb#
+#...#...#       #aaa#bbb#
+#...+...#       #aaa+bbb#      ('+' = doorway, its own region)
+#########       #########
+```
+
+These labels are **authored by hand, not derived.** It is tempting to recover
+rooms automatically (spectral clustering of the free-cell graph, say), but the
+hypothesis under test is precisely *whether latent structure recovers rooms* —
+so a ground truth produced by a clustering algorithm would make metric C a
+comparison of two clusterings rather than a measurement against truth. We
+designed these mazes, so we know the answer; write it down explicitly and keep
+it independent of anything the analysis does.
+
+`regions` is `None` for mazes that genuinely have no rooms (`spiral`, `loop` —
+a single corridor has no meaningful partition). Metric C is therefore reported
+only for `open_room`, `two_rooms`, `four_rooms` and `two_rooms_open`, and
+`metrics.py` must skip rather than fabricate it elsewhere. Doorway cells get
+their own region label so they can be excluded from purity scoring — a cell in
+a doorway has genuinely ambiguous membership, and counting it as a failure of
+either room would understate the metric.
 
 `MazeSpec.to_upstream_layout(train: bool)` returns the list-of-lists upstream
 wants. In train layouts every free cell is a goal (uniform goal sampling over
@@ -317,6 +350,21 @@ functions is a smaller surface than a maintained fork. The patch is covered by
 a test that asserts upstream names still resolve (Section 11).
 
 ### 4.3 The maze set
+
+**None of these are upstream's.** JaxGCRL ships exactly three maze layouts
+(`u_maze`, `big_maze`, `hardest_maze`, plus two `*_EVAL` goal-restricted
+variants), shared by `SimpleMaze`, `AntMaze` and `HumanoidMaze`. They are
+general-purpose navigation benchmarks — they were not built to isolate any
+particular property of a representation, and none of them is a clean control.
+`hardest_maze` in particular confounds everything at once: it has rooms,
+corridors, dead ends and cycles simultaneously, so a result on it cannot be
+attributed to any single structural feature.
+
+We therefore author our own set, and keep upstream's three reachable through
+the `register.py` fallback (Section 4.2) for two purposes only: the setup
+sanity run required by the proposal ("training sample runs on Simple maze and
+Ant maze"), and as a comparison point if a reviewer asks how our mazes relate
+to the benchmark's.
 
 Six layouts. Four carry the "≥ 4 mazes" requirement; the other two exist as
 controls, which is what makes the four interpretable.
@@ -479,9 +527,11 @@ A ratio near 1 means the encoder ignores walls; large means it respects them.
 This is a single number per maze and is the cleanest headline result.
 
 **C. Room purity (Q2).**
-For M1/M2, fraction of each cell's `k=10` latent nearest neighbours that lie in
-the same room. Compared against the same statistic computed on raw `(x, y)`,
-which is the "no information beyond position" null.
+For mazes carrying a `regions` overlay (Section 4.1) — M0, M1, M2, M5 —
+fraction of each cell's `k=10` latent nearest neighbours sharing its region
+label, excluding doorway cells. Compared against the same statistic computed on
+raw `(x, y)`, which is the "no information beyond position" null. Not defined
+for M3/M4, which have no rooms.
 
 **D. Projection faithfulness (Q2).**
 Trustworthiness and continuity of the 2-D PCA/t-SNE/UMAP embedding w.r.t. the
@@ -598,8 +648,10 @@ held-out split.
 
 Splitting the decoder's data randomly would let it memorise a lookup table
 over sampled cells, and reconstruction error would be meaninglessly low.
-Instead: **hold out whole regions.** For M2, train on three rooms, test on the
-fourth; for M3, hold out a contiguous arc of the spiral. Report train,
+Instead: **hold out whole regions.** For M2, train on three rooms and test on
+the fourth, using the `regions` overlay (Section 4.1) as the split; for M3,
+which has no rooms, hold out a contiguous arc of the spiral by geodesic index
+from the corridor's start. Report train,
 in-distribution-held-out-samples, and held-out-region errors separately. Only
 the third number says anything about whether the latent space is smoothly
 organised. This is also what makes the interpolation experiment (Section 8.3)
