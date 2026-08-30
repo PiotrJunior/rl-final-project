@@ -13,6 +13,7 @@ defaults here are provisional).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -248,13 +249,64 @@ class RunSpec:
 
     @property
     def num_prefill_env_steps(self) -> int:
+        """Prefill as `train_fn`'s *budget arithmetic* assumes it.
+
+        Upstream is inconsistent here: it sizes the training budget with
+        `min_replay_size * num_envs`, but the prefill loop actually runs
+        `ceil(min_replay_size / unroll_length)` actor steps, each worth
+        `num_envs * unroll_length` env steps. The two differ whenever
+        `unroll_length` does not divide `min_replay_size`. Both numbers are
+        real and both are needed - this one drives how many training steps get
+        scheduled, `prefill_env_steps_actual` is what the counter records.
+        """
         return self.min_replay_size * self.num_envs
 
     @property
-    def num_training_steps_per_epoch(self) -> int:
-        return (self.total_env_steps - self.num_prefill_env_steps) // (
-            self.num_evals * self.env_steps_per_actor_step
+    def prefill_actor_steps(self) -> int:
+        return math.ceil(self.min_replay_size / self.unroll_length)
+
+    @property
+    def prefill_env_steps_actual(self) -> int:
+        """Prefill as the env-step counter actually increments it."""
+        return self.prefill_actor_steps * self.env_steps_per_actor_step
+
+    def _steps_per_epoch_for(self, total: int) -> int:
+        return (total - self.num_prefill_env_steps) // (self.num_evals * self.env_steps_per_actor_step)
+
+    def _reachable_steps_for(self, total: int) -> int:
+        return (
+            self.prefill_env_steps_actual
+            + self.num_evals * self._steps_per_epoch_for(total) * self.env_steps_per_actor_step
         )
+
+    @property
+    def effective_total_env_steps(self) -> int:
+        """The value handed to `RunConfig`, which is not always the one asked for.
+
+        `train_fn` ends with `assert total_steps >= config.total_env_steps`,
+        and because the schedule floor-divides, the steps it actually runs can
+        land *below* the total it was given - so a run trains for hours and
+        then dies on an assertion while returning. Upstream's own documented
+        defaults trip this (50M requested, 47.9M reached).
+
+        We therefore pass the largest total the schedule can actually reach.
+        `_reachable_steps_for` is monotone in `total` and strictly below it
+        when the assert would fail, so iterating converges - in practice after
+        one or two rounds.
+        """
+        total = self.total_env_steps
+        for _ in range(64):
+            reachable = self._reachable_steps_for(total)
+            if reachable >= total:
+                return total
+            total = reachable
+        raise ConfigError(  # pragma: no cover - unreachable by the monotonicity above
+            f"could not find a total_env_steps the schedule reaches from {self.total_env_steps}"
+        )
+
+    @property
+    def num_training_steps_per_epoch(self) -> int:
+        return self._steps_per_epoch_for(self.effective_total_env_steps)
 
     @property
     def env_steps_per_epoch(self) -> int:
@@ -263,9 +315,14 @@ class RunSpec:
 
     @property
     def actual_total_env_steps(self) -> int:
-        """What the run really executes - integer division makes this differ
-        from the requested `total_env_steps`."""
-        return self.num_prefill_env_steps + self.num_evals * self.env_steps_per_epoch
+        """Env steps the counter reaches at the end of the run. Equals
+        `effective_total_env_steps`, and is at or below the requested total."""
+        return self.prefill_env_steps_actual + self.num_evals * self.env_steps_per_epoch
+
+    @property
+    def satisfies_upstream_final_assert(self) -> bool:
+        """`assert total_steps >= config.total_env_steps` at the end of `train_fn`."""
+        return self.actual_total_env_steps >= self.effective_total_env_steps
 
     @property
     def replay_buffer_bytes(self) -> int:
@@ -339,12 +396,22 @@ class RunSpec:
             return
         budget = self.total_env_steps - self.num_prefill_env_steps
         min_total = self.num_prefill_env_steps + self.num_evals * self.env_steps_per_actor_step
-        raise ConfigError(
+        head = (
             f"num_training_steps_per_epoch would be 0: {self.num_evals} evals of "
             f"{self.env_steps_per_actor_step} env steps each do not fit in "
-            f"{self.total_env_steps} steps after {self.num_prefill_env_steps} of prefill.\n"
-            f"  raise total_env_steps to at least {min_total}, or lower num_evals to at most "
-            f"{max(1, budget // self.env_steps_per_actor_step)}."
+            f"{self.total_env_steps} steps after {self.num_prefill_env_steps} of prefill."
+        )
+        if budget <= 0:
+            # Prefill alone exhausts the budget, so trimming evals cannot help.
+            raise ConfigError(
+                f"{head}\n  prefill alone ({self.min_replay_size} x {self.num_envs} = "
+                f"{self.num_prefill_env_steps}) exceeds total_env_steps, so lowering num_evals "
+                f"cannot help: raise total_env_steps above {min_total}, or lower "
+                f"min_replay_size / num_envs."
+            )
+        raise ConfigError(
+            f"{head}\n  raise total_env_steps to at least {min_total}, or lower num_evals to "
+            f"at most {budget // self.env_steps_per_actor_step}."
         )
 
     def evolve(self, **changes) -> RunSpec:

@@ -25,9 +25,11 @@ grid/world geometry, registration with upstream's env classes, and the
 training entrypoint (presets, run-spec validation, manifests, env
 construction, CLI).
 
-161 fast tests pass. 23 `slow` tests need `jaxgcrl` installed and have **not**
-been run — they cover the upstream monkey-patch, the env dimension table, and
-a tiny end-to-end training run. Run them before the first long run.
+All 230 tests pass, including the 23 `slow` ones (upstream monkey-patch, env
+dimension table, two real end-to-end training runs) — verified against
+`jaxgcrl` on CPU. Run `pytest tests -q -m slow` on a new machine before a long
+run; it needs `pip install -e third_party/JaxGCRL` plus `wandb wandb-osh`,
+which upstream's package `__init__` imports even for env-only use.
 
 Next is step 3.5: the resumable `train_fn` derivative (§5.5) and the timing
 probe (§5.6). Do not start a long run before the resume path is tested by a
@@ -90,6 +92,10 @@ the traps:
 - Checkpoints are `(alpha_params, actor_params, critic_params)` where
   `critic_params` has keys `sa_encoder` and `g_encoder`.
 - `CRL.check_config` enforces `num_envs * (episode_length - 1) % batch_size == 0`.
+- **`train_fn` ends with `assert total_steps >= config.total_env_steps`, and its
+  own schedule can fall short of the total it was handed** — upstream's
+  documented defaults trip it. Never pass a raw budget; pass
+  `RunSpec.effective_total_env_steps`. LLD §5.3c.
 - Upstream's `notebooks/visualize.ipynb` is **stale** — it calls
   `make_crl_networks`, `get_env_config` and `args.env_name`, none of which
   exist at the pinned commit. Don't copy it.

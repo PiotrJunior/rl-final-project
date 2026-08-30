@@ -737,6 +737,46 @@ env step. `describe` prints both numbers side by side and suggests
 consequence of the budget cut, not an incidental one, and it should not be
 discovered from a flat training curve.
 
+### 5.3c Upstream's closing assertion, and why we do not pass the requested budget
+
+`CRL.train_fn` ends with:
+
+```python
+total_steps = current_step
+assert total_steps >= config.total_env_steps
+```
+
+This can fail **after a run has completed all of its training**, killing the
+process on the way out. Two things combine:
+
+1. Prefill is accounted twice, inconsistently. The budget arithmetic uses
+   `num_prefill_env_steps = min_replay_size * num_envs`, but the prefill loop
+   runs `ceil(min_replay_size / unroll_length)` whole actor steps, each worth
+   `num_envs * unroll_length` env steps. The two differ whenever
+   `unroll_length` does not divide `min_replay_size` - at upstream's defaults,
+   1000 and 62.
+2. `num_training_steps_per_epoch` floor-divides, and the remainder discarded
+   can be nearly a whole epoch per eval.
+
+The steps actually executed are
+`(ceil(min_replay/unroll) + num_evals * steps_per_epoch) * num_envs * unroll_length`,
+which lands below `total_env_steps` for many ordinary settings - **upstream's
+own documented defaults included**: `--total_env_steps 50000000` with
+`num_envs 256, num_evals 200` reaches 47,885,824 and trips the assertion.
+
+We do not patch upstream for this. `RunSpec.effective_total_env_steps` instead
+computes the largest total the schedule can actually reach, by iterating
+`reachable(total)` to a fixed point (monotone and strictly decreasing while the
+assertion would fail, so it converges - two rounds in practice), and *that* is
+what `RunConfig` receives. `spec.total_env_steps` keeps the requested figure
+for the manifest and for reporting, and `describe` prints both whenever they
+differ. `satisfies_upstream_final_assert` is asserted for every shipped
+default in the test suite.
+
+The invariant the tests enforce is that a configuration either fails
+validation immediately with a stated remedy, or runs to completion - never the
+third outcome of constructing cleanly and dying on an assertion hours later.
+
 ### 5.4 Logging
 
 wandb project `crl-latent-mining`, group = maze name, run name = `run_id`.

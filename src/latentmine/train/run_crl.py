@@ -106,10 +106,15 @@ def describe(spec: RunSpec) -> str:
         f"critic          energy '{spec.energy_fn}', loss '{spec.contrastive_loss_fn}', "
         f"gamma {spec.discounting}",
         "",
-        f"total steps     {spec.actual_total_env_steps:,} actually run "
-        f"(requested {spec.total_env_steps:,}; integer division truncates)",
-        f"  prefill       {spec.num_prefill_env_steps:,} "
-        f"({100.0 * spec.num_prefill_env_steps / max(spec.actual_total_env_steps, 1):.1f}%), "
+        f"total steps     {spec.actual_total_env_steps:,} actually run"
+        + (
+            f"  (requested {spec.total_env_steps:,}; the schedule cannot reach it, "
+            "so this is what upstream is asked for too)"
+            if spec.effective_total_env_steps != spec.total_env_steps
+            else ""
+        ),
+        f"  prefill       {spec.prefill_env_steps_actual:,} "
+        f"({100.0 * spec.prefill_env_steps_actual / max(spec.actual_total_env_steps, 1):.1f}%), "
         f"re-paid on every resume unless the buffer is checkpointed",
         f"  per epoch     {spec.env_steps_per_epoch:,} env steps "
         f"({spec.num_training_steps_per_epoch} train steps x "
@@ -219,7 +224,10 @@ def train(spec: RunSpec, runs_dir: Path, wandb_enabled: bool, wandb_mode: str, w
     # value honest for anything that logs the config.
     config = RunConfig(
         env=spec.maze,
-        total_env_steps=spec.total_env_steps,
+        # Not spec.total_env_steps: train_fn's closing assert compares the
+        # steps it reached against this value, and its own schedule can fall
+        # short of what it was asked for. See RunSpec.effective_total_env_steps.
+        total_env_steps=spec.effective_total_env_steps,
         episode_length=spec.episode_length,
         num_envs=spec.num_envs,
         num_eval_envs=spec.num_eval_envs,

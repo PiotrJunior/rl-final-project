@@ -131,6 +131,10 @@ class TestEndToEnd:
 
     @pytest.fixture
     def tiny(self):
+        # Replay sizes must be passed at construction, not via evolve() after
+        # it: validation runs in __post_init__, so a later change would be
+        # checked against the wrong prefill - which is exactly how this
+        # fixture was wrong the first time.
         return make_run_spec(
             "two_rooms",
             "simple",
@@ -139,7 +143,9 @@ class TestEndToEnd:
             num_envs=64,
             num_evals=1,
             num_eval_envs=8,
-        ).evolve(min_replay_size=100, max_replay_size=1000)
+            min_replay_size=100,
+            max_replay_size=1000,
+        )
 
     def test_a_run_completes_and_leaves_a_loadable_artifact_set(self, tiny, tmp_path):
         from latentmine.train import manifest

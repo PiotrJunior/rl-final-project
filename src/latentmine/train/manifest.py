@@ -103,6 +103,7 @@ def build(spec: RunSpec, run_dir: Path, extra: dict[str, Any] | None = None) -> 
             "backend": spec.resolved_backend,
             "seed": spec.seed,
             "total_env_steps": spec.total_env_steps,
+            "effective_total_env_steps": spec.effective_total_env_steps,
             "actual_total_env_steps": spec.actual_total_env_steps,
             "episode_length": spec.episode_length,
             "num_envs": spec.num_envs,
@@ -114,6 +115,7 @@ def build(spec: RunSpec, run_dir: Path, extra: dict[str, Any] | None = None) -> 
         "derived": {
             "env_steps_per_actor_step": spec.env_steps_per_actor_step,
             "num_prefill_env_steps": spec.num_prefill_env_steps,
+            "prefill_env_steps_actual": spec.prefill_env_steps_actual,
             "num_training_steps_per_epoch": spec.num_training_steps_per_epoch,
             "env_steps_per_epoch": spec.env_steps_per_epoch,
             "replay_buffer_bytes": spec.replay_buffer_bytes,

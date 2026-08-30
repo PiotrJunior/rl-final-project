@@ -176,3 +176,89 @@ class TestModuleIsJaxFree:
             check=True,
         )
         assert out.stdout.strip() == "False", out.stdout
+
+
+class TestPrefillExhaustsBudget:
+    def test_error_says_trimming_evals_cannot_help(self):
+        # When prefill alone exceeds total_env_steps, suggesting a lower
+        # num_evals is useless - the advice has to point at prefill.
+        with pytest.raises(ConfigError, match="prefill alone"):
+            make_run_spec(
+                "two_rooms",
+                "simple",
+                total_env_steps=50_000,
+                episode_length=101,
+                num_envs=64,
+                num_evals=1,
+                min_replay_size=1000,
+            )
+
+
+class TestUpstreamFinalAssert:
+    """`train_fn` ends with `assert total_steps >= config.total_env_steps`, and
+    its own schedule can fall short of the total it was handed - a run trains
+    for hours and then dies while returning. These pin the workaround."""
+
+    def test_prefill_accounting_has_two_distinct_meanings(self):
+        # Upstream sizes the budget with min_replay_size * num_envs but the
+        # prefill loop runs ceil(min_replay/unroll) whole actor steps.
+        spec = make_run_spec("two_rooms", "simple", num_envs=128)
+        assert spec.num_prefill_env_steps == 1000 * 128
+        assert spec.prefill_env_steps_actual == 17 * 128 * 62
+        assert spec.prefill_env_steps_actual > spec.num_prefill_env_steps
+
+    def test_prefill_accounting_agrees_when_unroll_divides_min_replay(self):
+        spec = make_run_spec("two_rooms", "simple", num_envs=128, min_replay_size=62 * 8)
+        assert spec.prefill_env_steps_actual == spec.num_prefill_env_steps
+
+    def test_effective_total_is_reachable(self):
+        spec = make_run_spec("two_rooms", "simple")
+        assert spec.effective_total_env_steps < spec.total_env_steps
+        assert spec.actual_total_env_steps >= spec.effective_total_env_steps
+
+    def test_effective_total_is_a_fixed_point(self):
+        # Passing it back through must not shrink it again, or train_fn would
+        # recompute a smaller schedule and fail anyway.
+        spec = make_run_spec("two_rooms", "simple")
+        again = spec.evolve(total_env_steps=spec.effective_total_env_steps)
+        assert again.effective_total_env_steps == spec.effective_total_env_steps
+        assert again.num_training_steps_per_epoch == spec.num_training_steps_per_epoch
+
+    def test_upstreams_own_defaults_would_have_failed(self):
+        # Documents the bug rather than just working around it silently:
+        # 50M requested, ~47.9M reached.
+        spec = make_run_spec(
+            "two_rooms",
+            "ant",
+            total_env_steps=50_000_000,
+            episode_length=1001,
+            num_envs=256,
+            num_evals=200,
+        )
+        assert spec._reachable_steps_for(50_000_000) < 50_000_000
+        assert spec.satisfies_upstream_final_assert  # ...but ours does
+
+    @pytest.mark.parametrize("env", sorted(PROVISIONAL_BUDGETS))
+    @pytest.mark.parametrize("maze", list(layouts.names()))
+    def test_every_shipped_default_satisfies_it(self, env, maze):
+        assert make_run_spec(maze, env).satisfies_upstream_final_assert
+
+    @pytest.mark.parametrize("num_evals", [1, 7, 50, 100, 199])
+    @pytest.mark.parametrize("num_envs", [64, 128, 256])
+    @pytest.mark.parametrize("total", [3_000_000, 7_500_000])
+    def test_any_spec_that_constructs_satisfies_it(self, num_evals, num_envs, total):
+        """The real invariant: a config either fails validation with a remedy,
+        or it reaches the total it hands upstream. Never the third thing -
+        constructing fine and then dying on the assert hours later."""
+        try:
+            spec = make_run_spec(
+                "two_rooms",
+                "simple",
+                num_envs=num_envs,
+                num_evals=num_evals,
+                total_env_steps=total,
+            )
+        except ConfigError:
+            return  # rejected up front, which is the other acceptable outcome
+        assert spec.num_training_steps_per_epoch > 0
+        assert spec.satisfies_upstream_final_assert
