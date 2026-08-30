@@ -120,6 +120,39 @@ PCA). Our default is `energy_fn=norm`, which is also the setting under which
 - `env.observation_size == state_dim + len(goal_indices)`; the observation is
   `concat(qpos[:-2], qvel[:-2], target_xy)`.
 
+The `[:-2]` slices drop the `target` body's two slide joints, which every maze
+XML appends. So `state_dim` is the *agent's* DOF count:
+
+| env | qpos | qvel | `state_dim` |
+|---|---|---|---|
+| `SimpleMaze` | 2 (slide x, slide y) | 2 | 4 |
+| `AntMaze` | 15 (3 pos + 4 quat + 8 hinges) | 14 (3 lin + 3 ang + 8 hinges) | 29 |
+
+`SimpleMaze`'s torso has its free joint commented out in `simple_maze.xml` and
+replaced by two slide joints, so it is a planar point mass: `(x, y, vx, vy)`.
+
+Both maze envs set `exclude_current_positions_from_observation=False` (vanilla
+Brax `Ant` defaults it to `True`). That is why `goal_indices = [0, 1]` works at
+all — `x` and `y` are retained at the front of the observation, so the goal is
+literally a slice of the state, and `psi` and the first two state dims live in
+the same coordinate frame.
+
+Index layout for AntMaze's 29 dims, which metric E (Section 6) groups over:
+
+| slice | contents |
+|---|---|
+| `0:2`   | `x`, `y` — the goal dims |
+| `2:3`   | `z` (torso height) |
+| `3:7`   | root quaternion (orientation) |
+| `7:15`  | 8 joint angles (hip/ankle × 4) |
+| `15:18` | root linear velocity |
+| `18:21` | root angular velocity |
+| `21:29` | 8 joint velocities |
+
+The velocity ordering follows the MuJoCo/Brax free-joint convention; assert it
+against a real `env.reset()` in the tests rather than trusting this table, since
+a mis-grouped metric E would misattribute what `phi` encodes.
+
 So `psi` takes a **2-D input** (the goal `xy`) in every maze env. This is the
 single most useful fact in the project: `psi : R^2 -> R^d` can be rastered
 over a dense grid, giving a per-pixel latent map of the maze with no rollouts
