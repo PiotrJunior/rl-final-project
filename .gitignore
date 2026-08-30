@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.python-version
+
+# JAX / experiment output
+runs/
+artifacts/
+figures/
+renders/
+wandb/
+*.pkl
+*.npz
+*.mp4
+*.html.gz
+
+# Vendored upstream (added as submodule; keep the pointer, not a stray clone)
+third_party/JaxGCRL/**/__pycache__/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
