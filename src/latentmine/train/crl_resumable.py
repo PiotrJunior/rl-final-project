@@ -20,6 +20,7 @@ modified in exactly these places:
   5. write a resume checkpoint at the end of every epoch
   6. take the step count from training_state, which a fully-resumed run still has
   7. bind `params` unconditionally, so a run with checkpointing disabled can return
+  8. widen the default `progress_fn` so it accepts the keyword it is called with
 
 `test_resume.py` asserts the SHA-256 of upstream's `crl.py` still matches
 `UPSTREAM_CRL_SHA256`, so bumping the submodule fails loudly and someone
@@ -84,7 +85,11 @@ class ResumableCRL(CRL):
         randomization_fn: Optional[
             Callable[[base.System, jnp.ndarray], Tuple[base.System, base.System]]
         ] = None,
-        progress_fn: Callable[[int, Metrics], None] = lambda *args: None,
+        # Patch 8: upstream's default is `lambda *args: None`, which cannot
+        # absorb the `do_render=` keyword it is then called with, so calling
+        # train_fn without a progress_fn raises TypeError. run.py always
+        # passes one, so upstream never hits it.
+        progress_fn: Callable[..., None] = lambda *args, **kwargs: None,
         resume_dir=None,
         config_hash: str = "",
         on_epoch=None,
