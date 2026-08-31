@@ -39,6 +39,17 @@ src = ["src", "tests"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+# Same reason as the lint ignores above: keep the vendored copy diffable.
+exclude = ["src/latentmine/train/crl_resumable.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Vendored derivative of upstream's train_fn. Kept in upstream's style so it
+# stays diffable against the pinned commit; restyling it would make the copy
+# impossible to review. Only style rules are waived - E501/E731 line length and
+# lambdas, UP modernisation. F (undefined names, unused imports), the rest of
+# E, B and I stay enforced, and F821 is what caught a missing import in the
+# first extraction.
+"src/latentmine/train/crl_resumable.py" = ["E731", "E501", "UP"]

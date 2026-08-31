@@ -31,9 +31,12 @@ dimension table, two real end-to-end training runs) — verified against
 run; it needs `pip install -e third_party/JaxGCRL` plus `wandb wandb-osh`,
 which upstream's package `__init__` imports even for env-only use.
 
-Next is step 3.5: the resumable `train_fn` derivative (§5.5) and the timing
-probe (§5.6). Do not start a long run before the resume path is tested by a
-deliberate `SIGKILL`.
+Step 3.5 is done too: `train/crl_resumable.py` (a vendored derivative of
+upstream's `train_fn` with resume hooks, guarded by a SHA-256 drift test),
+`train/resume.py` (atomic two-slot checkpoints), and `train/probe.py`. The
+kill-and-resume milestone passes — a SIGKILLed run resumes and skips no work.
+
+Next: analysis (§7), decoder (§8), control (§10).
 
 ## Layout (target — most of this is not built yet)
 

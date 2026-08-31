@@ -625,6 +625,22 @@ known location, and those artifacts land in the same plots we intend to draw
 conclusions from. Kept only as an emergency fallback if the vendored copy
 proves unmaintainable.
 
+#### What "at most one epoch" actually means
+
+Implementing this exposed a detail worth stating precisely. The order inside
+the loop is: run the epoch, evaluate, call `progress_fn`, write the analysis
+checkpoint, then write the resume checkpoint. A process killed between the
+progress line and the resume write has *completed* that epoch's work but not
+recorded it, so the resumed run redoes it.
+
+That is the guarantee working, not a bug: a crash costs at most one epoch and
+skips none. But it means the step counter across a resume seam can **repeat** a
+value, and a test asserting a perfectly uniform sequence of steps fails on a
+correct implementation. The test therefore asserts what is actually promised -
+every step delta is either zero (one repeated epoch) or one epoch, never more,
+and at most one repeat. Reordering the writes would move the window, not close
+it, so it is left as is and documented instead.
+
 #### Granularity is a dial
 
 One epoch is
@@ -1028,11 +1044,9 @@ that validates it.
    `--dry-run` resolves and reports a whole configuration without importing
    JAX. The 10k-step milestone run is written as a `slow` test
    (`TestEndToEnd`) and still needs a machine with `jaxgcrl` installed.
-3.5 `train/crl_resumable.py` (Section 5.5) and the timing probe (Section 5.6).
-   **Milestone: kill a run with `SIGKILL` mid-epoch, resume it, and confirm
-   the training curve has no discontinuity at the seam.** Do this before any
-   long run, not after the first one dies. Then set all budgets from the
-   measured `training/sps`.
+3.5 ~~`train/crl_resumable.py` (Section 5.5) and the timing probe.~~ **Done**,
+   milestone included: a run is SIGKILLed mid-training and resumed, and the
+   test asserts it skips no work. One correction from doing it - see below.
 4. `checkpoints.py`, `embed.py`. **Milestone: load a checkpoint, embed a grid,
    confirm `d_lat` to the goal decreases along a successful rollout** (§7.1).
    Do not proceed past this until it holds.

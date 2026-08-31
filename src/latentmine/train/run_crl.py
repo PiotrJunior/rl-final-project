@@ -74,6 +74,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     o = p.add_argument_group("output")
     o.add_argument("--runs-dir", type=Path, default=Path("runs"))
+    o.add_argument(
+        "--resume",
+        default="auto",
+        help="auto (default): continue if runs/<run_id>/resume/ matches this config. "
+        "never: always start fresh. A config mismatch is always an error, never a "
+        "silent restart from zero.",
+        choices=("auto", "never"),
+    )
     o.add_argument("--wandb", action="store_true", help="log to wandb (offline by default)")
     o.add_argument("--wandb-mode", default="offline", choices=("online", "offline"))
     o.add_argument("--wandb-project", default="crl-latent-mining")
@@ -100,7 +108,7 @@ def spec_from_args(args: argparse.Namespace) -> RunSpec:
         )
         if getattr(args, k) is not None
     }
-    return make_run_spec(args.maze, args.env, args.preset, args.seed, **overrides)
+    return make_run_spec(args.maze, args.env, args.preset, args.seed, args.profile, **overrides)
 
 
 def describe(spec: RunSpec) -> str:
@@ -194,21 +202,13 @@ def _is_scalar(value: Any) -> bool:
     return getattr(value, "ndim", 0) == 0
 
 
-def train(spec: RunSpec, runs_dir: Path, wandb_enabled: bool, wandb_mode: str, wandb_project: str) -> Path:
-    """Run training. Imports JAX, so it is never reached under `--dry-run`."""
-    from jaxgcrl.agents.crl import CRL
-    from jaxgcrl.utils.config import RunConfig
+def build_agent(spec: RunSpec):
+    """The CRL agent for a run spec, with upstream's inverted field names
+    mapped back: n_hidden is depth, h_dim is width."""
+    from .crl_resumable import ResumableCRL
 
-    from .envs import build_envs
-
-    run_dir = runs_dir / spec.run_id
-    ckpt_dir = run_dir / "ckpt"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    train_env, eval_env = build_envs(spec)
     arch = spec.arch
-
-    agent = CRL(
+    return ResumableCRL(
         policy_lr=spec.policy_lr,
         critic_lr=spec.critic_lr,
         alpha_lr=spec.alpha_lr,
@@ -219,8 +219,6 @@ def train(spec: RunSpec, runs_dir: Path, wandb_enabled: bool, wandb_mode: str, w
         max_replay_size=spec.max_replay_size,
         min_replay_size=spec.min_replay_size,
         unroll_length=spec.unroll_length,
-        # Upstream's names invert the usual convention: n_hidden is depth,
-        # h_dim is width.
         h_dim=arch.width,
         n_hidden=arch.depth,
         skip_connections=arch.skip_connections,
@@ -230,10 +228,12 @@ def train(spec: RunSpec, runs_dir: Path, wandb_enabled: bool, wandb_mode: str, w
         contrastive_loss_fn=spec.contrastive_loss_fn,
         energy_fn=spec.energy_fn,
     )
-    # `RunConfig.env` is typed Literal[legal_envs] but flax.struct.dataclass
-    # does not enforce annotations, and train_fn never reads the field - it
-    # only reaches create_env, which we bypass. Passing our maze name keeps the
-    # value honest for anything that logs the config.
+
+
+def build_config(spec: RunSpec, checkpoint_dir: Path | None):
+    """Upstream's RunConfig for a run spec."""
+    from jaxgcrl.utils.config import RunConfig
+
     config = RunConfig(
         env=spec.maze,
         # Not spec.total_env_steps: train_fn's closing assert compares the
@@ -249,8 +249,36 @@ def train(spec: RunSpec, runs_dir: Path, wandb_enabled: bool, wandb_mode: str, w
         exp_name=spec.run_id,
         log_wandb=False,  # we drive wandb ourselves; upstream's path assumes run.py
         visualization_interval=spec.visualization_interval,
-        checkpoint_logdir=str(ckpt_dir),
+        checkpoint_logdir=str(checkpoint_dir) if checkpoint_dir else None,
     )
+    return config
+
+
+def train(
+    spec: RunSpec,
+    runs_dir: Path,
+    wandb_enabled: bool,
+    wandb_mode: str,
+    wandb_project: str,
+    resume: str = "auto",
+) -> Path:
+    """Run training. Imports JAX, so it is never reached under `--dry-run`."""
+    from . import resume as resume_mod
+    from .envs import build_envs
+
+    run_dir = runs_dir / spec.run_id
+    ckpt_dir = run_dir / "ckpt"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    resume_dir = run_dir / resume_mod.RESUME_DIRNAME
+
+    train_env, eval_env = build_envs(spec)
+
+    agent = build_agent(spec)
+    # `RunConfig.env` is typed Literal[legal_envs] but flax.struct.dataclass
+    # does not enforce annotations, and train_fn never reads the field - it
+    # only reaches create_env, which we bypass. Passing our maze name keeps the
+    # value honest for anything that logs the config.
+    config = build_config(spec, ckpt_dir)
     agent.check_config(config)
 
     wandb_run = None
@@ -265,8 +293,16 @@ def train(spec: RunSpec, runs_dir: Path, wandb_enabled: bool, wandb_mode: str, w
             config=manifest.build(spec, run_dir),
         )
 
-    manifest.write(spec, run_dir, extra={"wandb_run_id": getattr(wandb_run, "id", None)})
+    payload = manifest.write(spec, run_dir, extra={"wandb_run_id": getattr(wandb_run, "id", None)})
+    config_hash = manifest.config_hash(manifest.load(payload))
+
+    if resume == "never":
+        resume_mod.clear(resume_dir)
+    pointer = resume_mod.read_pointer(resume_dir)
+
     print(describe(spec))
+    if pointer:
+        print(f"\nresuming from epoch {pointer['next_epoch']}/{spec.num_evals} ({resume_dir})")
     print(f"\nwriting to {run_dir}\n", flush=True)
 
     _, params, metrics = agent.train_fn(
@@ -274,7 +310,12 @@ def train(spec: RunSpec, runs_dir: Path, wandb_enabled: bool, wandb_mode: str, w
         train_env=train_env,
         eval_env=eval_env,
         progress_fn=progress_printer(spec, run_dir, wandb_run),
+        resume_dir=resume_dir,
+        config_hash=config_hash,
     )
+    # The run finished, so the resume state is dead weight - and leaving it
+    # would make a re-run of the same command a no-op instead of a fresh run.
+    resume_mod.clear(resume_dir)
     if wandb_run is not None:
         wandb_run.finish()
     print(f"\ndone: {run_dir}")
@@ -297,7 +338,14 @@ def main(argv: list[str] | None = None) -> int:
             print("\n(dry run - no JAX imported, nothing written)")
         return 0
 
-    train(spec, args.runs_dir, args.wandb, args.wandb_mode, args.wandb_project)
+    train(
+        spec,
+        args.runs_dir,
+        args.wandb,
+        args.wandb_mode,
+        args.wandb_project,
+        resume=args.resume,
+    )
     return 0
 
 

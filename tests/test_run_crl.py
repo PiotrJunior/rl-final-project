@@ -120,3 +120,32 @@ class TestProgressCallback:
         progress = run_crl.progress_printer(spec, run_dir, wandb_run=None)
         progress(10, {"training/sps": 12.0}, lambda p: None, {}, object(), do_render=True)
         assert (run_dir / "metrics.jsonl").exists()
+
+
+class TestProfileSelection:
+    """A profile that parses but never reaches the spec is the worst kind of
+    bug: the CLI accepts it and silently trains the wrong configuration."""
+
+    def test_profile_reaches_the_spec(self):
+        args = run_crl.build_parser().parse_args(["--maze", "two_rooms", "--profile", "smoke"])
+        spec = run_crl.spec_from_args(args)
+        assert spec.profile == "smoke"
+        assert spec.num_envs == 64
+
+    def test_default_profile_is_gpu(self):
+        args = run_crl.build_parser().parse_args(["--maze", "two_rooms"])
+        spec = run_crl.spec_from_args(args)
+        assert spec.profile == "gpu"
+        assert spec.num_envs == 512
+
+    @pytest.mark.parametrize("profile", ["gpu", "laptop", "smoke"])
+    def test_each_profile_selects_its_own_budget(self, profile):
+        from latentmine.train.presets import BUDGET_PROFILES
+
+        args = run_crl.build_parser().parse_args(["--maze", "two_rooms", "--profile", profile])
+        spec = run_crl.spec_from_args(args)
+        assert spec.num_envs == BUDGET_PROFILES[profile]["simple"]["num_envs"]
+
+    def test_the_profile_is_reported(self):
+        args = run_crl.build_parser().parse_args(["--maze", "two_rooms", "--profile", "laptop"])
+        assert "profile         laptop" in run_crl.describe(run_crl.spec_from_args(args))
