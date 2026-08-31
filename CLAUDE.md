@@ -20,37 +20,29 @@ should cite one.
 
 ## Status
 
-Build steps 1-3 of LLD §12 are done: the package scaffold, the five-maze set,
-grid/world geometry, registration with upstream's env classes, and the
-training entrypoint (presets, run-spec validation, manifests, env
-construction, CLI).
+**The pipeline is complete and tested; what remains is running it.** All of
+LLD §12 is implemented except step 12, the write-up, which needs the GPU runs.
 
-All 230 tests pass, including the 23 `slow` ones (upstream monkey-patch, env
-dimension table, two real end-to-end training runs) — verified against
-`jaxgcrl` on CPU. Run `pytest tests -q -m slow` on a new machine before a long
-run; it needs `pip install -e third_party/JaxGCRL` plus `wandb wandb-osh`,
-which upstream's package `__init__` imports even for env-only use.
+460 fast tests and 51 `slow` ones (the latter need `jaxgcrl` installed). The
+slow set covers the upstream monkey-patch, the env dimension table, real
+training runs, a SIGKILL-and-resume cycle, and the decoder pipeline.
 
-Step 3.5 is done too: `train/crl_resumable.py` (a vendored derivative of
-upstream's `train_fn` with resume hooks, guarded by a SHA-256 drift test),
-`train/resume.py` (atomic two-slot checkpoints), and `train/probe.py`. The
-kill-and-resume milestone passes — a SIGKILLed run resumes and skips no work.
-
-Next: analysis (§7), decoder (§8), control (§10).
+Next: run the grid on the CUDA box, then write up `docs/results/`.
 
 ## Layout (target — most of this is not built yet)
 
 ```
 docs/LOW_LEVEL_DESIGN.md   the design contract
-third_party/JaxGCRL/       git submodule, pinned to 7c53a074      [done]
+third_party/JaxGCRL/       git submodule, pinned to 7c53a074
 src/latentmine/            all logic lives here
-  mazes/                   MazeSpec registry, geometry, register  [done]
-  train/                   presets, manifest, envs, run_crl        [done]
+  mazes/                   MazeSpec registry, geometry, register, render
+  train/                   presets, manifest, envs, resume, probe, run_crl
   checkpoints.py           load params -> jitted phi/psi
   embed.py, sampling.py, rollouts.py
-  analysis/                projections, metrics, plots, bottleneck, reconstruct
+  analysis/                projections, metrics, plots, bottleneck, reconstruct, run
   decoder/                 frozen-encoder decoder + latent interpolation
   control/                 waypoint-conditioned rollouts
+  exploit.py               decoder + interpolation + waypoints, end to end
 notebooks/                 exploration only, nothing load-bearing
 tests/
 ```
@@ -129,8 +121,14 @@ pip install wandb wandb-osh   # upstream's __init__ imports these even env-only
 pytest tests -q -m "not slow"
 ruff check src tests && ruff format --check src tests
 
-# render the maze set (first milestone; catches the axis convention)
+# render the maze set (catches the axis convention)
 python -m latentmine.mazes.render --out figures/mazes
+
+# analyse trained runs: metrics, figures, seed aggregation
+python -m latentmine.analysis.run runs/* --out artifacts --figures figures
+
+# decoder, latent interpolation and waypoint scoring
+python -m latentmine.exploit runs/<run_id>
 
 # check a configuration in one second, importing no JAX
 python -m latentmine.train.run_crl --maze two_rooms --env simple --dry-run
