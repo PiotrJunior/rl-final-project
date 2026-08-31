@@ -113,6 +113,10 @@ class TestInstall:
         R.uninstall()
 
     def test_install_is_idempotent(self):
+        # Start from a known state: other test modules construct envs, which
+        # installs the patch and never removes it, so this would otherwise
+        # depend on test ordering.
+        R.uninstall()
         assert R.install() == ("simple_maze", "ant_maze")
         assert R.install() == ()
         assert R.is_installed()

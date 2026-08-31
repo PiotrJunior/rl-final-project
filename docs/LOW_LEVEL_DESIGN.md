@@ -871,9 +871,31 @@ held-out split.
 
 Splitting the decoder's data randomly would let it memorise a lookup table
 over sampled cells, and reconstruction error would be meaninglessly low.
-Instead: **hold out whole regions.** For `four_rooms`, train on three rooms and
-test on the fourth, using the `regions` overlay (Section 4.1) as the split; for
-`spiral`,
+**Correction from implementing this: one split is not enough.** A held-out
+*region* lies outside the coordinate range the decoder ever saw, so recovering
+it is **extrapolation**, and a neural network does not extrapolate. Measured on
+the easiest possible case - a latent that is an exact linear map of position -
+the region-holdout error is 1.62 against 0.01 on training cells. That number
+says the decoder cannot extrapolate. It says nothing about whether the latent
+space is smoothly organised, which is the question this section set out to ask,
+and reading it as such would manufacture a negative result.
+
+So two splits, always reported together:
+
+- `scattered_split` holds out individual cells spread through the maze. They
+  are inside the range but unseen, so this measures **interpolation** - the
+  actual "is the latent smooth?" question. On the linear-map case it scores
+  0.42 against the region split's 1.62.
+- `spatial_split` holds out whole regions and measures **extrapolation**,
+  which is the harder and more interesting generalisation claim when it works.
+
+High scattered error means the latent is not smoothly organised. Low scattered
+error with high region error means it is smooth and the decoder was simply
+asked to extrapolate.
+
+The region split itself: **hold out whole regions.** For `four_rooms`, train on
+three rooms and test on the fourth, using the `regions` overlay (Section 4.1)
+as the split; for `spiral`,
 which has no rooms, hold out a contiguous arc of the spiral by geodesic index
 from the corridor's start. Report train,
 in-distribution-held-out-samples, and held-out-region errors separately. Only

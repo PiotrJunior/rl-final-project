@@ -48,7 +48,11 @@ def spatial_split(
 
     Three numbers come out of this and they must always be reported together:
     training error, held-out-samples error (same regions), and held-out-region
-    error. Only the third says anything about generalisation.
+    error.
+
+    Read the third carefully. A held-out region is outside the coordinate
+    range the decoder saw, so it measures **extrapolation**, not smoothness -
+    see `scattered_split`, which measures the interpolation question instead.
     """
     if spec.regions is None:
         return geodesic_split(spec, cell_index, val_fraction=val_fraction, seed=seed)
@@ -109,6 +113,43 @@ def geodesic_split(
         test=np.flatnonzero(in_test),
         kind="geodesic arc",
         held_out=(f"furthest {test_fraction:.0%} by geodesic distance",),
+    )
+
+
+def scattered_split(
+    spec: MazeSpec,
+    cell_index: np.ndarray,
+    test_fraction: float = 0.2,
+    val_fraction: float = 0.1,
+    seed: int = 0,
+) -> Split:
+    """Hold out individual cells scattered through the maze.
+
+    The complement of `spatial_split`, and both are needed to read the result
+    (LLD section 8.2). A held-out *region* lies outside the coordinate range
+    the decoder ever saw, so recovering it is **extrapolation**, and an MLP
+    does not extrapolate: on a latent that is an exact linear map of position -
+    the easiest possible case - the region-holdout error is 1.62 against 0.01
+    on training cells. That number says the decoder cannot extrapolate; it
+    says nothing about whether the latent space is smoothly organised.
+
+    Scattered cells are inside the range but unseen, so they measure
+    interpolation, which is the question "is the latent smooth?" actually
+    asks. Report the two together: high scattered error means the latent is
+    not smoothly organised, while low scattered error with high region error
+    means it is smooth but the decoder was asked to extrapolate.
+    """
+    n = len(cell_index)
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(n)
+    n_test = int(round(test_fraction * n))
+    n_val = int(round(val_fraction * n))
+    return Split(
+        train=np.sort(order[n_test + n_val :]),
+        val=np.sort(order[n_test : n_test + n_val]),
+        test=np.sort(order[:n_test]),
+        kind="scattered",
+        held_out=(f"{test_fraction:.0%} of cells, scattered",),
     )
 
 

@@ -106,6 +106,35 @@ class TestSpatialSplit:
         assert {spec.regions[i][j] for (i, j) in cells[index[split.test]]} == {"b"}
 
 
+class TestScatteredSplit:
+    def test_held_out_cells_are_spread_through_the_maze(self):
+        spec = L.get("two_rooms")
+        index = np.arange(len(spec.free_cells()))
+        split = data.scattered_split(spec, index, seed=0)
+        cells = geo.free_cell_array(spec)
+        regions = {spec.regions[i][j] for (i, j) in cells[split.test]}
+        assert regions >= {"a", "b"}, "a scattered split must touch every region"
+
+    def test_splits_are_disjoint_and_complete(self):
+        spec = L.get("spiral")
+        index = np.arange(len(spec.free_cells()))
+        split = data.scattered_split(spec, index)
+        joined = np.concatenate([split.train, split.val, split.test])
+        assert sorted(joined.tolist()) == list(index)
+
+    def test_it_is_reproducible(self):
+        spec = L.get("two_rooms")
+        index = np.arange(len(spec.free_cells()))
+        a = data.scattered_split(spec, index, seed=1)
+        b = data.scattered_split(spec, index, seed=1)
+        np.testing.assert_array_equal(a.test, b.test)
+
+    def test_it_works_where_there_are_no_rooms(self):
+        spec = L.get("loop")
+        split = data.scattered_split(spec, np.arange(len(spec.free_cells())))
+        assert len(split.test) > 0
+
+
 class TestStandardise:
     def test_training_data_becomes_zero_mean_unit_variance(self):
         rng = np.random.default_rng(0)
@@ -148,10 +177,50 @@ class TestFit:
         result = fit(latents, world, split, {"xy": (0, 2)}, steps=1500, log_every=250)
 
         assert result.errors["train"]["xy"] < 0.2
-        # Held-out region: the real test. A linear map generalises, so this
-        # should also be low - if it is not, the training loop is broken.
-        assert result.errors["test (held-out regions)"]["xy"] < 0.6
+        assert result.errors["val (same regions)"]["xy"] < 0.4
         assert result.decode(latents[:5]).shape == (5, 2)
+
+    def test_a_held_out_region_measures_extrapolation_not_smoothness(self):
+        """The confound worth stating. Region `b` occupies a coordinate range
+        the decoder never sees, so recovering it means extrapolating - and an
+        MLP does not extrapolate, even a perfectly linear map. On this exact
+        latent the region-holdout error is ~1.6 against ~0.01 on training
+        cells, while a scattered holdout inside the same range stays low.
+        Reading the region number as evidence about the latent's smoothness
+        would be wrong; that is what the scattered split is for."""
+        pytest.importorskip("jaxgcrl")
+        from latentmine.decoder.train import fit
+
+        spec = L.get("two_rooms")
+        world = geo.cells_to_world(geo.free_cell_array(spec), spec.scaling)
+        rng = np.random.default_rng(0)
+        latents = world @ rng.normal(size=(2, 16))
+        index = np.arange(len(world))
+
+        region = fit(
+            latents,
+            world,
+            data.spatial_split(spec, index, hold_out="b"),
+            {"xy": (0, 2)},
+            steps=2500,
+            log_every=250,
+        )
+        scattered = fit(
+            latents,
+            world,
+            data.scattered_split(spec, index, seed=0),
+            {"xy": (0, 2)},
+            steps=2500,
+            log_every=250,
+        )
+        # The contrast is the claim. The absolute bound is loose on purpose:
+        # a scattered split of 57 cells leaves ~11 test cells, so its error is
+        # noisy, while the region/scattered ratio is not.
+        assert scattered.errors["test (held-out regions)"]["xy"] < 0.8
+        assert (
+            region.errors["test (held-out regions)"]["xy"]
+            > 2 * scattered.errors["test (held-out regions)"]["xy"]
+        )
 
     def test_all_three_error_numbers_are_reported(self):
         pytest.importorskip("jaxgcrl")
