@@ -511,12 +511,9 @@ which matters when we later interpolate in `psi`-space and decode),
 `logsumexp_penalty_coeff=0.1`, `episode_length=1001`, `num_envs=512`
 (satisfies `512*1000 % 256 == 0`), `action_repeat=1`.
 
-Budget: **to be set from a measured timing probe, not guessed** — see
-Section 5.6. The reference hardware for this project is a laptop, not the
-single-GPU machine upstream's throughput claims assume, and the original
-budget in this document (SimpleMaze 10M, AntMaze 50M, six mazes × three seeds
-× two envs) was written before that was known. Section 5.6 replaces it.
-Seeds `{1, 2, 3}`. `visualization_interval=10`, `checkpoint_logdir` always set.
+Budget: SimpleMaze 10M steps, AntMaze 50M, `num_envs=512`,
+`episode_length=1001` — the `gpu` profile of Section 5.6. Seeds `{1, 2, 3}`.
+`visualization_interval=10`, `checkpoint_logdir` always set.
 
 An `energy_fn ∈ {norm, dot}` comparison on `two_rooms` is a deliberate secondary
 experiment: the "Why is CRL latent space nice" paper's claims are
@@ -645,151 +642,70 @@ config, otherwise start fresh. A config mismatch is a hard error, never a
 silent fresh start — silently restarting a 6-hour run from zero is worse than
 crashing.
 
-### 5.6 Running on Apple Silicon (the actual target hardware)
+### 5.6 Hardware: train on GPU, analyse anywhere
 
-The reference machine for this project is an M1 Pro MacBook with 32 GB, which
-invalidates several assumptions written above.
+Training runs on a CUDA machine. That is a change from an earlier draft of
+this document, which assumed an M1 Pro laptop and cut the experiment plan
+accordingly; those cuts are reverted. The laptop is still where analysis and
+development happen, and that split is a comfortable one because the two halves
+have very different costs.
 
-**There is no CUDA, and effectively no GPU.** `pyproject.toml`'s non-Linux
-branch installs plain `jaxlib==0.4.25`, so JAX runs on **CPU**. Apple's
-`jax-metal` PJRT plugin exists, but it is experimental, tightly coupled to
-particular JAX versions, and has incomplete op coverage that Brax and MJX
-routinely trip over. Treat it as an experiment to be smoke-tested, never as the
-plan: if a 10k-step run does not produce numerically sane metrics on metal,
-drop it without further investigation.
+**Why the split works.** The expensive half is rollout collection and gradient
+steps. The analysis half is not: the central object, `psi`, takes only `(x, y)`
+(Section 2.4), so the dense latent map over a 68-cell maze is 68 forward passes
+through a 4x256 MLP. Projections, metrics and the decoder all run on arrays of
+a few thousand rows. None of that needs a GPU, and none of it needs the
+training stack to be fast.
 
-**Consequences that change the plan:**
+So: train on the GPU box, copy `runs/<run_id>/` back, and do everything from
+Section 7 onward locally. The manifest makes those directories self-describing
+(Section 5.1), including the maze grid, so the analysis machine needs no
+knowledge of how the run was launched.
 
-- *`num_envs=512` is a GPU number.* On CPU the vectorisation payoff saturates
-  much earlier and memory pressure arrives sooner. Start at 128 and let the
-  probe below settle it. Keep `num_envs * (episode_length - 1) % batch_size == 0`.
-- *`episode_length=1001` is wasteful for small mazes.* Crossing a 9×9 maze
-  takes far fewer than 1000 steps, and cost is linear in episode length. 501 is
-  a reasonable start. This is not a free knob — `flatten_batch` samples the
-  future goal within an episode, so episode length sets the horizon the critic
-  is trained over. Shortening it is defensible for small mazes but must be held
-  *identical across all mazes and seeds*, since it changes what the latent
-  space means.
-- *Backend:* `spring` (upstream's default for both maze envs) is far cheaper
-  than `mjx` on CPU. Do not switch to `mjx`.
-- *Prevent sleep:* run under `caffeinate -i`. A closed lid mid-run is the most
-  likely "crash" on a laptop, and it is the one the resume path will actually
-  be exercised by.
-- *wandb offline:* `wandb_mode="offline"`, synced afterwards, so a network drop
-  cannot stall training.
-- Thermal throttling over multi-hour runs makes `training/sps` drift downward.
-  That is expected; do not read it as a training pathology.
+**Budget profiles** (`train/presets.py: BUDGET_PROFILES`):
 
-**Step 3.5 of the build order: measure before committing to a budget.**
-Upstream's "10M steps in 10 minutes" is a single-GPU figure. CPU will be one to
-two orders of magnitude below it, but the exact factor depends on env,
-`num_envs` and backend in ways not worth predicting. So: run
-`total_env_steps=200_000` on `two_rooms` for both `SimpleMaze` and `AntMaze`,
-record `training/sps`, and derive every budget in the project from the measured
-number. Sweep `num_envs ∈ {64, 128, 256}` in the same probe; it is a few
-minutes of work and it sets a parameter that multiplies every run afterwards.
+| profile | env | `num_envs` | `episode_length` | requested steps | utd |
+|---|---|---|---|---|---|
+| `gpu` | simple | 512 | 1001 | 10M | 0.0631 |
+| `gpu` | ant | 512 | 1001 | 50M | 0.0631 |
+| `laptop` | simple | 128 | 501 | 5M | 0.0316 |
+| `laptop` | ant | 128 | 1001 | 10M | 0.0631 |
+| `smoke` | either | 64 | 101 | 200k | 0.0064 |
 
-**Expected restructuring of the experiment plan.** Pending those numbers, the
-likely shape is:
+`gpu` is the default and what the reported runs use. `laptop` exists for
+working on the pipeline without a GPU to hand, and `smoke` for a minute-scale
+end-to-end check. Note what the laptop profile costs: shortening
+`episode_length` to 501 halves the update-to-data ratio, because fewer
+gradient updates are taken per env step. `describe` prints ours next to
+upstream's and suggests `--train-step-multiplier 2` when it drops. Episode
+length is not a free knob in any case - `flatten_batch` samples the future
+goal within an episode, so it sets the horizon the critic is trained over, and
+it must be identical across every maze and seed in a comparison.
 
-- `SimpleMaze` becomes the primary platform and carries the full design — all
-  six mazes × three seeds. Its physics is a 2-DOF point mass, which is the
-  cheapest thing in the repository.
-- `AntMaze` becomes a reduced study: one or two mazes (`two_rooms` for the
-  bottleneck result, `spiral` for the geodesic result), fewer seeds, run
-  overnight. The Ant results answer Q3, which needs *some* Ant runs, not the
-  full grid.
-- The `deeper` preset, the `energy_fn` comparison and the `repr_dim` sweep are
-  the first things cut.
+**Installation on the CUDA box.** Upstream pins `jaxlib==0.4.25+cuda12.cudnn89`
+on Linux and requires CUDA >= 12.3:
 
-If the probe shows even that is out of reach, renting a single cloud GPU for
-the Ant runs is a better use of a day than reducing the SimpleMaze study —
-Section 12's guidance stands: three seeds of the core beats one seed of
-everything.
-
-### 5.3b Configuration is validated before JAX loads
-
-Upstream enforces its two hard constraints late: `CRL.check_config` asserts the
-batch divisibility rule, and `num_training_steps_per_epoch > 0` is a bare
-`assert` after env setup. On a laptop, discovering either after JAX has
-compiled is a wasted minute every time, and the assertion text does not say
-what to change.
-
-`train/presets.py` therefore re-derives every quantity `train_fn` computes -
-`env_steps_per_actor_step`, prefill, steps per epoch, actual total, buffer
-bytes, utd ratio - and validates them at construction, with errors that name a
-remedy ("nearest valid num_envs: [128, 64, 192, 256]"). It imports no JAX,
-brax or mujoco, which is what lets `run_crl --dry-run` print the resolved
-configuration in a second on a machine with no training stack at all. A test
-asserts that JAX-free property rather than trusting it.
-
-The same separation gives the env dimension table (`ENV_SPECS`): `state_dim`,
-`action_size` and `goal_size` are hardcoded so the config layer and the
-manifest need no env instance, and `envs.build_env` asserts every one of them
-against the constructed env, so they are checked invariants rather than
-assumptions.
-
-One measured consequence worth recording: shortening `episode_length` to 501
-for the laptop budget halves the update-to-data ratio relative to upstream's
-defaults (0.0316 against 0.0630), because fewer gradient updates are taken per
-env step. `describe` prints both numbers side by side and suggests
-`--train-step-multiplier 2` when ours falls well below. That is a real
-consequence of the budget cut, not an incidental one, and it should not be
-discovered from a flat training curve.
-
-### 5.3c Upstream's closing assertion, and why we do not pass the requested budget
-
-`CRL.train_fn` ends with:
-
-```python
-total_steps = current_step
-assert total_steps >= config.total_env_steps
+```bash
+pip install -e third_party/JaxGCRL -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install -e .
 ```
 
-This can fail **after a run has completed all of its training**, killing the
-process on the way out. Two things combine:
+Upstream's package `__init__` imports `wandb_osh` even for env-only use, so
+`wandb` and `wandb-osh` are required whether or not logging is enabled.
+Confirm the GPU is actually in use before starting a long run - JAX falls back
+to CPU silently, and a run that would take twenty minutes takes a day:
+`python -c "import jax; print(jax.devices())"` must show a `cuda` device.
 
-1. Prefill is accounted twice, inconsistently. The budget arithmetic uses
-   `num_prefill_env_steps = min_replay_size * num_envs`, but the prefill loop
-   runs `ceil(min_replay_size / unroll_length)` whole actor steps, each worth
-   `num_envs * unroll_length` env steps. The two differ whenever
-   `unroll_length` does not divide `min_replay_size` - at upstream's defaults,
-   1000 and 62.
-2. `num_training_steps_per_epoch` floor-divides, and the remainder discarded
-   can be nearly a whole epoch per eval.
+**The experiment plan, restored.** All five mazes x both envs x three seeds on
+the `deep` preset, plus `shallow` on `two_rooms` and `spiral` for the depth
+comparison, plus `deep_noln` on the same two to isolate depth from LayerNorm
+(Section 5.2). At upstream's stated single-GPU throughput this is hours, not
+days, so the earlier plan to reduce Ant to one or two mazes is unnecessary.
 
-The steps actually executed are
-`(ceil(min_replay/unroll) + num_evals * steps_per_epoch) * num_envs * unroll_length`,
-which lands below `total_env_steps` for many ordinary settings - **upstream's
-own documented defaults included**: `--total_env_steps 50000000` with
-`num_envs 256, num_evals 200` reaches 47,885,824 and trips the assertion.
-
-We do not patch upstream for this. `RunSpec.effective_total_env_steps` instead
-computes the largest total the schedule can actually reach, by iterating
-`reachable(total)` to a fixed point (monotone and strictly decreasing while the
-assertion would fail, so it converges - two rounds in practice), and *that* is
-what `RunConfig` receives. `spec.total_env_steps` keeps the requested figure
-for the manifest and for reporting, and `describe` prints both whenever they
-differ. `satisfies_upstream_final_assert` is asserted for every shipped
-default in the test suite.
-
-The invariant the tests enforce is that a configuration either fails
-validation immediately with a stated remedy, or runs to completion - never the
-third outcome of constructing cleanly and dying on an assertion hours later.
-
-### 5.4 Logging
-
-wandb project `crl-latent-mining`, group = maze name, run name = `run_id`.
-Beyond upstream's metrics we log, every `visualization_interval` evals, a
-**latent map snapshot**: PCA of `psi` over the free-cell grid, coloured by
-true `(x, y)`, rendered to an image. Stitched over training this gives a video
-of the latent space organising itself — cheap to produce and the clearest
-qualitative evidence that structure emerges rather than being an artifact of
-initialisation. `critic_loss`, `categorical_accuracy`, `logits_pos/neg` and
-`logsumexp` are the health indicators; a collapsed `categorical_accuracy` means
-the checkpoint is not worth analysing.
-
----
+**The timing probe still earns its place**, but its job has changed: not to
+decide whether the plan is feasible, but to confirm the GPU is being used and
+to pick `num_envs` for the specific card. Run it once on the target machine
+before queueing the grid.
 
 ## 6. Metrics — how a negative result gets stated
 
@@ -1150,7 +1066,8 @@ core.
 | Linear latent interpolation leaves the manifold | Decoded waypoints are garbage; looks like a negative result but is not | Latent graph geodesic (§8.3 baseline 4) built up front |
 | Upstream submodule bump breaks the monkey-patch | Silent fallback to wrong layouts | `register` test asserts both our and upstream names resolve; pin the commit |
 | `deep` vs `shallow` confounded with LayerNorm | Over-claiming "depth helps" | State the confound; optionally run `n_hidden=4, use_ln=False` as a third arm |
-| Laptop CPU throughput far below the plan's assumption | The full grid never finishes; results thin across the board | Timing probe at step 3.5 sets budgets from measurement; SimpleMaze carries the design, Ant reduced (§5.6) |
-| Crash / lid close loses hours of training | Upstream checkpoints cannot resume — params only, no optimiser state | Resume checkpoints (§5.5), `caffeinate -i`, resume path tested by deliberate `SIGKILL` before any long run |
+| JAX silently falls back to CPU on the GPU box | A twenty-minute run takes a day and nobody notices until it doesn't finish | Probe asserts a `cuda` device before any long run (§5.6) |
+| Runs happen on a machine we do not own | Interruptions are outside our control, and a lost run is someone else's inconvenience too | Resume checkpoints (§5.5), tested by deliberate `SIGKILL` before the grid is queued |
+| Crash or interruption loses hours of training | Upstream checkpoints cannot resume — params only, no optimiser state | Resume checkpoints (§5.5), resume path tested by deliberate `SIGKILL` before any long run |
 | Torn checkpoint write during a crash | The one artifact you need is the one that is corrupt | tmp + fsync + atomic rename, two-slot rotation, checksum verified on load (§5.5) |
 | Vendored `train_fn` copy drifts from upstream | Silent divergence from the pinned implementation | SHA-256 drift test on upstream `crl.py` |

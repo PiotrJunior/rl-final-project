@@ -23,7 +23,16 @@ from typing import Any
 
 from ..mazes import layouts
 from . import manifest
-from .presets import ARCH_PRESETS, CONTRASTIVE_LOSS_FNS, ENERGY_FNS, ConfigError, RunSpec, make_run_spec
+from .presets import (
+    ARCH_PRESETS,
+    BUDGET_PROFILES,
+    CONTRASTIVE_LOSS_FNS,
+    DEFAULT_PROFILE,
+    ENERGY_FNS,
+    ConfigError,
+    RunSpec,
+    make_run_spec,
+)
 
 # Reference point for the utd ratio: upstream's own defaults. Ours is lower
 # whenever we shorten episodes for the laptop budget, and seeing the two side
@@ -42,7 +51,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--preset", default="deep", choices=sorted(ARCH_PRESETS))
     p.add_argument("--seed", type=int, default=1)
 
-    b = p.add_argument_group("budget (defaults are provisional - see LLD 5.6)")
+    b = p.add_argument_group("budget")
+    b.add_argument(
+        "--profile",
+        default=DEFAULT_PROFILE,
+        choices=sorted(BUDGET_PROFILES),
+        help="gpu: the real runs. laptop: CPU-sized smoke settings. smoke: minutes.",
+    )
     b.add_argument("--total-env-steps", type=int)
     b.add_argument("--episode-length", type=int)
     b.add_argument("--num-envs", type=int)
@@ -94,6 +109,7 @@ def describe(spec: RunSpec) -> str:
     crash_pct = 100.0 * spec.env_steps_per_epoch / max(spec.actual_total_env_steps, 1)
     lines = [
         f"run_id          {spec.run_id}",
+        f"profile         {spec.profile}",
         "",
         f"maze            {maze.name}  {maze.shape[0]}x{maze.shape[1]} grid, "
         f"{len(maze.free_cells())} free cells, scaling {maze.scaling:g}",
@@ -106,13 +122,9 @@ def describe(spec: RunSpec) -> str:
         f"critic          energy '{spec.energy_fn}', loss '{spec.contrastive_loss_fn}', "
         f"gamma {spec.discounting}",
         "",
-        f"total steps     {spec.actual_total_env_steps:,} actually run"
-        + (
-            f"  (requested {spec.total_env_steps:,}; the schedule cannot reach it, "
-            "so this is what upstream is asked for too)"
-            if spec.effective_total_env_steps != spec.total_env_steps
-            else ""
-        ),
+        f"total steps     {spec.actual_total_env_steps:,} actually run "
+        f"(requested {spec.total_env_steps:,}; rounded up to a whole epoch, "
+        f"{100.0 * (spec.actual_total_env_steps / max(spec.total_env_steps, 1) - 1):+.1f}%)",
         f"  prefill       {spec.prefill_env_steps_actual:,} "
         f"({100.0 * spec.prefill_env_steps_actual / max(spec.actual_total_env_steps, 1):.1f}%), "
         f"re-paid on every resume unless the buffer is checkpointed",

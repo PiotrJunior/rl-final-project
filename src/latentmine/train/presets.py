@@ -150,25 +150,77 @@ ENV_SPECS: dict[str, EnvSpec] = {
 }
 
 
-# Provisional budgets. LLD section 5.6: these are placeholders until the
-# timing probe measures throughput on the target laptop, and every one of them
-# should be replaced by a measured value before a long run.
-PROVISIONAL_BUDGETS: dict[str, dict[str, int]] = {
-    "simple": {
-        "total_env_steps": 5_000_000,
-        "episode_length": 501,
-        "num_envs": 128,
-        "num_evals": 100,
-        "num_eval_envs": 32,
+# Budget profiles (LLD section 5.6).
+#
+# `gpu` is the default and the one the real runs use: training happens on a
+# CUDA machine, so `num_envs` can be a GPU-sized number and episodes need not
+# be shortened. `laptop` keeps CPU-sized settings for smoke tests and for
+# working on the analysis code without a GPU to hand; note that its shorter
+# episodes halve the update-to-data ratio, which `describe` flags. `smoke` is
+# a minute-scale run that exercises the whole path end to end.
+#
+# Shortening `episode_length` is not a free knob: `flatten_batch` samples the
+# future goal within an episode, so it sets the horizon the critic is trained
+# over. It must be identical across every maze and seed in a comparison.
+BUDGET_PROFILES: dict[str, dict[str, dict[str, int]]] = {
+    "gpu": {
+        "simple": {
+            "total_env_steps": 10_000_000,
+            "episode_length": 1001,
+            "num_envs": 512,
+            "num_evals": 100,
+            "num_eval_envs": 128,
+        },
+        "ant": {
+            "total_env_steps": 50_000_000,
+            "episode_length": 1001,
+            "num_envs": 512,
+            "num_evals": 200,
+            "num_eval_envs": 128,
+        },
     },
-    "ant": {
-        "total_env_steps": 10_000_000,
-        "episode_length": 1001,
-        "num_envs": 128,
-        "num_evals": 100,
-        "num_eval_envs": 32,
+    "laptop": {
+        "simple": {
+            "total_env_steps": 5_000_000,
+            "episode_length": 501,
+            "num_envs": 128,
+            "num_evals": 100,
+            "num_eval_envs": 32,
+        },
+        "ant": {
+            "total_env_steps": 10_000_000,
+            "episode_length": 1001,
+            "num_envs": 128,
+            "num_evals": 100,
+            "num_eval_envs": 32,
+        },
+    },
+    "smoke": {
+        "simple": {
+            "total_env_steps": 200_000,
+            "episode_length": 101,
+            "num_envs": 64,
+            "num_evals": 2,
+            "num_eval_envs": 8,
+            "min_replay_size": 100,
+            "max_replay_size": 1000,
+        },
+        "ant": {
+            "total_env_steps": 200_000,
+            "episode_length": 101,
+            "num_envs": 64,
+            "num_evals": 2,
+            "num_eval_envs": 8,
+            "min_replay_size": 100,
+            "max_replay_size": 1000,
+        },
     },
 }
+
+DEFAULT_PROFILE = "gpu"
+
+# Retained for callers that predate profiles.
+PROVISIONAL_BUDGETS = BUDGET_PROFILES[DEFAULT_PROFILE]
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +260,7 @@ class RunSpec:
     alpha_lr: float = 3e-4
 
     action_repeat: int = 1
+    profile: str = DEFAULT_PROFILE
     backend: str | None = None
     visualization_interval: int = 10
     eval_goal_region: str | None = None
@@ -280,33 +333,43 @@ class RunSpec:
         )
 
     @property
-    def effective_total_env_steps(self) -> int:
-        """The value handed to `RunConfig`, which is not always the one asked for.
+    def num_training_steps_per_epoch(self) -> int:
+        """Training steps per eval epoch, rounding the requested budget **up**.
 
-        `train_fn` ends with `assert total_steps >= config.total_env_steps`,
-        and because the schedule floor-divides, the steps it actually runs can
-        land *below* the total it was given - so a run trains for hours and
-        then dies on an assertion while returning. Upstream's own documented
-        defaults trip this (50M requested, 47.9M reached).
+        `train_fn` computes this by floor division, which discards up to a full
+        `num_evals * env_steps_per_actor_step` - at GPU-sized `num_envs` that
+        quantum is millions of steps, and rounding down cost 31% of a 10M
+        request in practice. Rounding up instead overshoots by at most one
+        epoch, which is the same granularity as the checkpoint cadence, and
+        guarantees the run covers the budget that was actually asked for.
 
-        We therefore pass the largest total the schedule can actually reach.
-        `_reachable_steps_for` is monotone in `total` and strictly below it
-        when the assert would fail, so iterating converges - in practice after
-        one or two rounds.
+        `effective_total_env_steps` then hands `train_fn` a total that
+        floor-divides back to exactly this value.
         """
-        total = self.total_env_steps
-        for _ in range(64):
-            reachable = self._reachable_steps_for(total)
-            if reachable >= total:
-                return total
-            total = reachable
-        raise ConfigError(  # pragma: no cover - unreachable by the monotonicity above
-            f"could not find a total_env_steps the schedule reaches from {self.total_env_steps}"
-        )
+        budget = self.total_env_steps - self.num_prefill_env_steps
+        quantum = self.num_evals * self.env_steps_per_actor_step
+        return max(0, math.ceil(budget / quantum))
 
     @property
-    def num_training_steps_per_epoch(self) -> int:
-        return self._steps_per_epoch_for(self.effective_total_env_steps)
+    def effective_total_env_steps(self) -> int:
+        """The value handed to `RunConfig`, which is not the one asked for.
+
+        `train_fn` ends with `assert total_steps >= config.total_env_steps`,
+        and because its schedule floor-divides, the steps it runs can land
+        *below* the total it was given - so a run trains for hours and then
+        dies on an assertion while returning. Upstream's own documented
+        defaults trip this (50M requested, 47.9M reached).
+
+        We pass exactly the number of steps the run will reach. Because
+        `prefill_env_steps_actual >= num_prefill_env_steps` and their
+        difference is far smaller than one epoch, this value floor-divides
+        back to `num_training_steps_per_epoch`, so `train_fn` schedules what we
+        intended and its closing assertion holds with equality.
+        """
+        return (
+            self.prefill_env_steps_actual
+            + self.num_evals * self.num_training_steps_per_epoch * self.env_steps_per_actor_step
+        )
 
     @property
     def env_steps_per_epoch(self) -> int:
@@ -321,8 +384,20 @@ class RunSpec:
 
     @property
     def satisfies_upstream_final_assert(self) -> bool:
-        """`assert total_steps >= config.total_env_steps` at the end of `train_fn`."""
-        return self.actual_total_env_steps >= self.effective_total_env_steps
+        """`assert total_steps >= config.total_env_steps` at the end of `train_fn`.
+
+        Requires that the total we pass floor-divides back to the schedule we
+        planned; otherwise `train_fn` would run a different number of steps
+        than we computed.
+        """
+        return (
+            self._steps_per_epoch_for(self.effective_total_env_steps) == self.num_training_steps_per_epoch
+            and self.actual_total_env_steps >= self.effective_total_env_steps
+        )
+
+    @property
+    def covers_requested_budget(self) -> bool:
+        return self.actual_total_env_steps >= self.total_env_steps
 
     @property
     def replay_buffer_bytes(self) -> int:
@@ -425,10 +500,19 @@ def suggest_num_envs(episode_length: int, batch_size: int, near: int, span: int 
     return sorted(valid, key=lambda n: (abs(n - near), n))[:4]
 
 
-def make_run_spec(maze: str, env: str, preset: str = "deep", seed: int = 1, **overrides) -> RunSpec:
-    """A run spec with the provisional laptop budget for `env`, plus overrides."""
-    if env not in PROVISIONAL_BUDGETS:
-        raise ConfigError(f"unknown env {env!r}; known: {sorted(PROVISIONAL_BUDGETS)}")
-    budget = dict(PROVISIONAL_BUDGETS[env])
+def make_run_spec(
+    maze: str,
+    env: str,
+    preset: str = "deep",
+    seed: int = 1,
+    profile: str = DEFAULT_PROFILE,
+    **overrides,
+) -> RunSpec:
+    """A run spec with `profile`'s budget for `env`, plus any overrides."""
+    if profile not in BUDGET_PROFILES:
+        raise ConfigError(f"unknown profile {profile!r}; known: {sorted(BUDGET_PROFILES)}")
+    if env not in BUDGET_PROFILES[profile]:
+        raise ConfigError(f"unknown env {env!r}; known: {sorted(BUDGET_PROFILES[profile])}")
+    budget = dict(BUDGET_PROFILES[profile][env])
     budget.update({k: v for k, v in overrides.items() if v is not None})
-    return RunSpec(maze=maze, env=env, preset=preset, seed=seed, **budget)
+    return RunSpec(maze=maze, env=env, preset=preset, seed=seed, profile=profile, **budget)

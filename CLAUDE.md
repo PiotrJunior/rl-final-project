@@ -109,15 +109,18 @@ the traps:
 Nothing is implemented yet; these are the intended entry points and should be
 kept accurate as they land.
 
-Target hardware is an M1 Pro MacBook: **CPU-only JAX, no CUDA**. Budgets come
-from the timing probe in LLD §5.6, not from upstream's single-GPU throughput
-claims. Long runs go under `caffeinate -i`.
+Training runs on a **CUDA machine**; analysis runs anywhere, because `psi`
+takes only `(x, y)` so the dense latent map is a few dozen MLP forward passes.
+Budget profiles are `gpu` (default), `laptop` and `smoke` — LLD §5.6. Confirm
+`jax.devices()` shows a `cuda` device before a long run; JAX falls back to CPU
+silently.
 
 ```bash
 # setup
 git submodule update --init --recursive
 pip install -e third_party/JaxGCRL -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
 pip install -e .
+pip install wandb wandb-osh   # upstream's __init__ imports these even env-only
 
 # fast checks
 pytest tests -q -m "not slow"
@@ -130,11 +133,13 @@ python -m latentmine.mazes.render --out figures/mazes
 python -m latentmine.train.run_crl --maze two_rooms --env simple --dry-run
 
 # train
-caffeinate -i python -m latentmine.train.run_crl \
-    --maze two_rooms --env simple --preset deep --seed 1
+python -m latentmine.train.run_crl --maze two_rooms --env simple --preset deep --seed 1
 
-# throughput probe before setting any budget
-python -m latentmine.train.probe --env simple --num-envs 64,128,256
+# smaller profiles for development and smoke tests
+python -m latentmine.train.run_crl --maze two_rooms --profile smoke
+
+# confirm the GPU is used and pick num_envs for the card
+python -m latentmine.train.probe --env simple --num-envs 256,512,1024
 ```
 
 ## Git

@@ -10,8 +10,8 @@ import pytest
 from latentmine.mazes import layouts
 from latentmine.train.presets import (
     ARCH_PRESETS,
+    BUDGET_PROFILES,
     ENV_SPECS,
-    PROVISIONAL_BUDGETS,
     ConfigError,
     make_run_spec,
     suggest_num_envs,
@@ -60,19 +60,22 @@ class TestEnvSpecs:
 class TestDerivedQuantities:
     @pytest.fixture
     def spec(self):
-        return make_run_spec("two_rooms", "simple", num_envs=128, episode_length=501)
+        return make_run_spec("two_rooms", "simple", profile="laptop", num_envs=128, episode_length=501)
 
     def test_they_mirror_train_fns_arithmetic(self, spec):
         assert spec.env_steps_per_actor_step == spec.num_envs * spec.unroll_length
         assert spec.num_prefill_env_steps == spec.min_replay_size * spec.num_envs
-        assert spec.num_training_steps_per_epoch == (
-            (spec.total_env_steps - spec.num_prefill_env_steps)
-            // (spec.num_evals * spec.env_steps_per_actor_step)
+        # We round the schedule up, then hand train_fn a total that
+        # floor-divides back to it - so its arithmetic and ours agree on the
+        # value that matters.
+        assert spec._steps_per_epoch_for(spec.effective_total_env_steps) == (
+            spec.num_training_steps_per_epoch
         )
 
-    def test_actual_total_never_exceeds_the_request(self, spec):
-        # Integer division truncates, so the run is a little short of the ask.
-        assert spec.actual_total_env_steps <= spec.total_env_steps
+    def test_actual_total_covers_the_request(self, spec):
+        # Rounded up, so the run is a little over the ask rather than under it.
+        assert spec.actual_total_env_steps >= spec.total_env_steps
+        assert spec.covers_requested_budget
 
     def test_buffer_size_is_the_documented_product(self, spec):
         assert spec.replay_buffer_bytes == (
@@ -140,22 +143,26 @@ class TestValidation:
 
 
 class TestProvisionalBudgets:
-    @pytest.mark.parametrize("env", sorted(PROVISIONAL_BUDGETS))
+    @pytest.mark.parametrize("profile", sorted(BUDGET_PROFILES))
+    @pytest.mark.parametrize("env", ["simple", "ant"])
     @pytest.mark.parametrize("maze", list(layouts.names()))
     @pytest.mark.parametrize("preset", sorted(ARCH_PRESETS))
-    def test_every_default_combination_is_valid(self, env, maze, preset):
+    def test_every_default_combination_is_valid(self, profile, env, maze, preset):
         # A shipped default that fails validation is a trap for whoever runs
         # it first.
-        spec = make_run_spec(maze, env, preset)
+        spec = make_run_spec(maze, env, preset, profile=profile)
         assert spec.num_training_steps_per_epoch > 0
+        assert spec.satisfies_upstream_final_assert
+        assert spec.covers_requested_budget
 
-    @pytest.mark.parametrize("env", sorted(PROVISIONAL_BUDGETS))
+    @pytest.mark.parametrize("env", ["simple", "ant"])
     def test_defaults_keep_the_buffer_under_a_gigabyte(self, env):
-        # 32 GB laptop, and the buffer dominates a resume checkpoint.
+        # The buffer dominates a resume checkpoint and sits in GPU memory
+        # alongside the model.
         assert make_run_spec("two_rooms", env).replay_buffer_bytes < 1e9
 
     def test_a_crash_costs_at_most_a_few_percent(self):
-        spec = make_run_spec("two_rooms", "simple")
+        spec = make_run_spec("two_rooms", "simple", profile="gpu")
         assert spec.env_steps_per_epoch / spec.actual_total_env_steps < 0.05
 
 
@@ -211,18 +218,40 @@ class TestUpstreamFinalAssert:
         spec = make_run_spec("two_rooms", "simple", num_envs=128, min_replay_size=62 * 8)
         assert spec.prefill_env_steps_actual == spec.num_prefill_env_steps
 
-    def test_effective_total_is_reachable(self):
+    def test_effective_total_is_what_the_run_reaches(self):
         spec = make_run_spec("two_rooms", "simple")
-        assert spec.effective_total_env_steps < spec.total_env_steps
-        assert spec.actual_total_env_steps >= spec.effective_total_env_steps
+        assert spec.effective_total_env_steps == spec.actual_total_env_steps
 
-    def test_effective_total_is_a_fixed_point(self):
-        # Passing it back through must not shrink it again, or train_fn would
-        # recompute a smaller schedule and fail anyway.
-        spec = make_run_spec("two_rooms", "simple")
-        again = spec.evolve(total_env_steps=spec.effective_total_env_steps)
-        assert again.effective_total_env_steps == spec.effective_total_env_steps
-        assert again.num_training_steps_per_epoch == spec.num_training_steps_per_epoch
+    def test_the_budget_is_rounded_up_not_down(self):
+        # Floor division discards up to num_evals * env_steps_per_actor_step,
+        # which at GPU-sized num_envs is millions of steps.
+        spec = make_run_spec("two_rooms", "simple", profile="gpu")
+        assert spec.covers_requested_budget
+        assert spec.actual_total_env_steps >= spec.total_env_steps
+
+    def test_overshoot_is_bounded_by_one_epoch(self):
+        for profile in BUDGET_PROFILES:
+            for env in ("simple", "ant"):
+                spec = make_run_spec("two_rooms", env, profile=profile)
+                overshoot = spec.actual_total_env_steps - spec.total_env_steps
+                assert 0 <= overshoot < spec.num_evals * spec.env_steps_per_actor_step
+
+    def test_the_passed_total_reproduces_our_schedule(self):
+        # train_fn recomputes steps-per-epoch from what we hand it; if that
+        # disagreed with our number it would run a different schedule.
+        for profile in BUDGET_PROFILES:
+            spec = make_run_spec("two_rooms", "simple", profile=profile)
+            assert spec._steps_per_epoch_for(spec.effective_total_env_steps) == (
+                spec.num_training_steps_per_epoch
+            )
+
+    def test_profiles_are_distinct_where_it_matters(self):
+        gpu = make_run_spec("two_rooms", "simple", profile="gpu")
+        laptop = make_run_spec("two_rooms", "simple", profile="laptop")
+        assert gpu.num_envs > laptop.num_envs
+        assert gpu.episode_length > laptop.episode_length
+        # Shortening episodes is what costs the laptop profile its utd ratio.
+        assert gpu.utd_ratio > laptop.utd_ratio
 
     def test_upstreams_own_defaults_would_have_failed(self):
         # Documents the bug rather than just working around it silently:
@@ -238,7 +267,7 @@ class TestUpstreamFinalAssert:
         assert spec._reachable_steps_for(50_000_000) < 50_000_000
         assert spec.satisfies_upstream_final_assert  # ...but ours does
 
-    @pytest.mark.parametrize("env", sorted(PROVISIONAL_BUDGETS))
+    @pytest.mark.parametrize("env", ["simple", "ant"])
     @pytest.mark.parametrize("maze", list(layouts.names()))
     def test_every_shipped_default_satisfies_it(self, env, maze):
         assert make_run_spec(maze, env).satisfies_upstream_final_assert
