@@ -164,3 +164,67 @@ class TestFit:
         split = data.spatial_split(spec, np.arange(len(world)), hold_out="b")
         result = fit(latents, world, split, {"xy": (0, 2)}, steps=400, log_every=200)
         assert set(result.errors) == {"train", "val (same regions)", "test (held-out regions)"}
+
+
+@pytest.mark.slow
+class TestExploitPipeline:
+    """The exploitation half end to end, on a real (tiny) checkpoint."""
+
+    @pytest.fixture(scope="class")
+    def trained(self, tmp_path_factory):
+        pytest.importorskip("jaxgcrl.envs.simple_maze")
+        from latentmine.train.presets import make_run_spec
+        from latentmine.train.run_crl import train
+
+        spec = make_run_spec("two_rooms", "simple", profile="smoke", num_evals=2, total_env_steps=60_000)
+        return train(
+            spec,
+            tmp_path_factory.mktemp("runs"),
+            wandb_enabled=False,
+            wandb_mode="offline",
+            wandb_project="test",
+        )
+
+    def test_the_goal_decoder_reports_all_three_errors(self, trained):
+        from latentmine import checkpoints
+        from latentmine.exploit import fit_goal_decoder
+
+        encoders = checkpoints.load_encoders(trained)
+        fit, _, _, _, split = fit_goal_decoder(encoders, subdivisions=2, steps=600)
+        assert set(fit.errors) == {"train", "val (same regions)", "test (held-out regions)"}
+        assert split.kind == "region"
+        # The whole point of the spatial holdout: the held-out region is
+        # harder than held-out samples from training regions. If these were
+        # comparable, the split would not be testing generalisation.
+        assert fit.errors["test (held-out regions)"]["xy"] > fit.errors["val (same regions)"]["xy"]
+
+    def test_all_four_candidate_paths_are_produced_and_scored(self, trained):
+        from latentmine import checkpoints, embed, sampling
+        from latentmine.exploit import fit_goal_decoder, waypoint_paths
+
+        encoders = checkpoints.load_encoders(trained)
+        fit, xy, latents, _, _ = fit_goal_decoder(encoders, subdivisions=2, steps=400)
+        paths = waypoint_paths(encoders, fit, xy, latents, (1, 1), (7, 9))
+
+        assert [p.name for p in paths] == ["straight", "geodesic", "latent_linear", "latent_graph"]
+        for path in paths:
+            assert 0.0 <= path.valid_fraction <= 1.0
+            assert np.isfinite(path.length)
+        # The oracle is the calibration point: whatever the latent paths do,
+        # the geodesic route is legal by construction.
+        oracle = next(p for p in paths if p.name == "geodesic")
+        assert oracle.valid_fraction == 1.0
+        assert len(sampling.cell_centres(encoders.maze_spec)) == len(
+            embed.embed_goals(encoders, sampling.cell_centres(encoders.maze_spec))
+        )
+
+    def test_bottleneck_waypoints_land_in_free_space(self, trained):
+        from latentmine import checkpoints, embed, sampling
+        from latentmine.exploit import bottleneck_waypoints
+        from latentmine.mazes import geometry as geo
+
+        encoders = checkpoints.load_encoders(trained)
+        spec = encoders.maze_spec
+        latents = embed.embed_goals(encoders, sampling.cell_centres(spec))
+        for point in bottleneck_waypoints(encoders, latents, top=3):
+            assert spec.is_free(*geo.world_to_cell(tuple(point), spec.scaling))
