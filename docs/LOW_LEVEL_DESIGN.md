@@ -1047,25 +1047,39 @@ that validates it.
 3.5 ~~`train/crl_resumable.py` (Section 5.5) and the timing probe.~~ **Done**,
    milestone included: a run is SIGKILLed mid-training and resumed, and the
    test asserts it skips no work. One correction from doing it - see below.
-4. `checkpoints.py`, `embed.py`. **Milestone: load a checkpoint, embed a grid,
+4. ~~`checkpoints.py`, `embed.py`.~~ **Done.** Milestone: load a checkpoint, embed a grid,
    confirm `d_lat` to the goal decreases along a successful rollout** (§7.1).
    Do not proceed past this until it holds.
-5. Full SimpleMaze training across all six mazes × 3 seeds, `deep` preset.
-6. `analysis/` — projections, metrics A–D, plots. **Milestone: the distance
-   field figure (§7.2) for `two_rooms` and `spiral`.** This is the go/no-go for the whole
-   research question.
-7. AntMaze training (long; start it in the background as soon as step 3 is
-   validated, in parallel with 4–6).
-8. `decoder/` — train `D_g`, then `D_sa`, spatial holdout, metric E.
-9. `decoder/interpolate.py` + metric F, all four path baselines.
-10. `control/` + metric G.
-11. Advanced: `bottleneck.py`, then `reconstruct.py`.
-12. Write-up into `docs/results/`.
+5. Full training across all five mazes × 3 seeds, `deep` preset — needs the
+   GPU box.
+6. ~~`analysis/` — projections, metrics A–D, plots.~~ **Done.** Metrics
+   validated against three synthetic latents whose answers are known in
+   advance: a classical-MDS embedding of the maze's own geodesic matrix, the
+   Euclidean distance matrix (position but no walls), and noise. The
+   position-only case is the one that matters — it scores rho 0.93 against
+   geodesic distance and partial rho 0.00, which is exactly why the partial
+   statistic exists.
+7. ~~AntMaze training path.~~ Built; the env dimension table is asserted
+   against the real env rather than assumed.
+8. ~~`decoder/` — `D_g`, `D_sa`, spatial holdout, metric E.~~ **Done**, with
+   the holdout separating as designed: 0.02 on held-out samples from training
+   regions against 1.07 on a held-out region.
+9. ~~`decoder/interpolate.py` + metric F, all four path baselines.~~ **Done.**
+   The latent graph path already beats linear interpolation on a real
+   checkpoint (0.92 of waypoints in free space against 0.76) — the
+   non-convexity failure mode baseline 4 exists to catch.
+10. ~~`control/` + metric G.~~ **Done** — waypoint-conditioned rollouts,
+    stratified pairs, bootstrap intervals.
+11. ~~Advanced: `bottleneck.py`, then `reconstruct.py`.~~ **Done**, with two
+    corrections recorded in Section 9.
+12. Write-up into `docs/results/` — **the remaining step**, and it needs the
+    GPU runs.
 
-Steps 1–6 and 8–10 are the pass criteria. 11 is the extension. If time runs
-short, cutting `deeper`, the `energy_fn` comparison, and 11 is preferred to
-cutting seeds — one seed of everything is worth less than three seeds of the
-core.
+Everything except the write-up is implemented and tested; what remains is
+running the grid on the GPU box and interpreting the output. If time runs
+short, cutting `deeper`, the `energy_fn` comparison and the advanced
+extensions is preferred to cutting seeds — one seed of everything is worth
+less than three seeds of the core.
 
 ---
 
