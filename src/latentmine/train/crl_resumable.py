@@ -19,6 +19,7 @@ modified in exactly these places:
   4. start the loop at the resumed epoch, and carry its walltime
   5. write a resume checkpoint at the end of every epoch
   6. take the step count from training_state, which a fully-resumed run still has
+  7. bind `params` unconditionally, so a run with checkpointing disabled can return
 
 `test_resume.py` asserts the SHA-256 of upstream's `crl.py` still matches
 `UPSTREAM_CRL_SHA256`, so bumping the submodule fails loudly and someone
@@ -523,13 +524,18 @@ class ResumableCRL(CRL):
                 do_render=do_render,
             )
 
+            # Patch 7: upstream binds `params` only inside the branch below,
+            # so `return make_policy, params, metrics` raises UnboundLocalError
+            # whenever checkpoint_logdir is unset. run.py always sets it, so
+            # upstream never hits this - but the timing probe deliberately
+            # disables checkpointing, and did. Binding it unconditionally costs
+            # nothing: it is a tuple of references, not a copy.
+            params = (
+                training_state.alpha_state.params,
+                training_state.actor_state.params,
+                training_state.critic_state.params,
+            )
             if config.checkpoint_logdir:
-                # Save current policy and critic params.
-                params = (
-                    training_state.alpha_state.params,
-                    training_state.actor_state.params,
-                    training_state.critic_state.params,
-                )
                 path = f"{config.checkpoint_logdir}/step_{int(training_state.env_steps)}.pkl"
                 save_params(path, params)
 

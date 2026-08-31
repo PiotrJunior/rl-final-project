@@ -314,3 +314,28 @@ resume.save(d, _point(2, epoch=2))
     got = resume.load(tmp_path, _template())
     assert got is not None and got.next_epoch == 1
     assert not list(Path(tmp_path).glob("*.tmp"))
+
+
+@pytest.mark.slow
+class TestCheckpointingDisabled:
+    """The timing probe runs without a checkpoint directory. Upstream binds
+    `params` only inside the branch that writes one, so returning from such a
+    run raises UnboundLocalError - hit for real by the probe."""
+
+    def test_a_run_without_a_checkpoint_dir_returns_normally(self, tmp_path):
+        pytest.importorskip("jaxgcrl.envs.simple_maze")
+        from latentmine.train.envs import build_envs
+        from latentmine.train.presets import make_run_spec
+        from latentmine.train.run_crl import build_agent, build_config
+
+        spec = make_run_spec("two_rooms", "simple", profile="smoke", num_evals=1, total_env_steps=40_000)
+        train_env, eval_env = build_envs(spec)
+        agent = build_agent(spec)
+        _, params, _ = agent.train_fn(
+            config=build_config(spec, checkpoint_dir=None),
+            train_env=train_env,
+            eval_env=eval_env,
+        )
+        alpha, actor, critic = params
+        assert set(critic) == {"sa_encoder", "g_encoder"}
+        assert not list(tmp_path.iterdir()), "nothing should have been written"
