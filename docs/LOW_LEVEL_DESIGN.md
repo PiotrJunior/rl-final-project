@@ -723,6 +723,31 @@ decide whether the plan is feasible, but to confirm the GPU is being used and
 to pick `num_envs` for the specific card. Run it once on the target machine
 before queueing the grid.
 
+#### Measured CPU throughput, for calibration
+
+Taken on a 4-core Xeon @ 2.8 GHz with the `deep` preset. All figures are
+end-to-end including evaluation, which is the honest basis for a wall-clock
+estimate:
+
+| env | config | steps/s |
+|---|---|---|
+| `SimpleMaze` | `laptop` (128 envs, ep 501) | 392 |
+| `SimpleMaze` | `laptop` (256 envs, ep 501) | 399 |
+| `SimpleMaze` | `smoke` (64 envs, ep 101) | ~1370 |
+| `AntMaze` | `smoke` (64 envs, ep 101) | 162 |
+
+Two things worth carrying forward. **`num_envs` is not the lever on CPU** -
+392 against 399 across a doubling, because the bottleneck is not
+parallelism there; it is on a GPU, which is why the probe sweeps it. And
+**Ant costs about 8.5x SimpleMaze** at identical settings, which is the ratio
+to use when budgeting the Ant half of the grid.
+
+Extrapolating those to an M1 Pro (2-4x this box, an estimate rather than a
+measurement) puts a SimpleMaze run at 1-3.5 h and the full 15-run SimpleMaze
+grid at 15-30 h - feasible but slow - while a single `gpu`-profile Ant run
+lands at 3-6.5 days. That gap is the concrete reason the Ant half needs the
+CUDA machine, and it is what the split in this section is for.
+
 ## 6. Metrics — how a negative result gets stated
 
 The proposal explicitly permits a negative result. It is only worth anything

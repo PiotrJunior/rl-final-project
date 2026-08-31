@@ -110,6 +110,11 @@ Budget profiles are `gpu` (default), `laptop` and `smoke` — LLD §5.6. Confirm
 `jax.devices()` shows a `cuda` device before a long run; JAX falls back to CPU
 silently.
 
+Measured on CPU (4-core Xeon, `deep`): SimpleMaze 392 steps/s, AntMaze **8.5×
+slower**. `num_envs` barely moves CPU throughput but is the lever on GPU. LLD
+§5.6 has the table — Ant at the `gpu` budget is days on a laptop, which is why
+that half needs the GPU box.
+
 ```bash
 # setup
 git submodule update --init --recursive
